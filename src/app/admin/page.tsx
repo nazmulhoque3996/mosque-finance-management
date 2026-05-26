@@ -17,6 +17,9 @@ import {
   query,
   orderBy,
   Timestamp,
+  onSnapshot,
+  where,
+  setDoc,
 } from "firebase/firestore";
 import { auth, db } from "@/lib/firebase";
 import {
@@ -41,6 +44,9 @@ import {
   getAuditLogs,
   addAuditLog,
   uploadVoucherImage,
+  getSystemSettings,
+  updateSystemSettings,
+  generateReceiptId,
   UserProfile,
   Donation,
   Expense,
@@ -48,6 +54,7 @@ import {
   DashboardStats,
   UserRole,
   AuditLog,
+  SystemSettings,
 } from "@/lib/firestoreUtils";
 import { translateCategory } from "../page";
 
@@ -79,7 +86,8 @@ import {
   FileText,
   Search,
   UploadCloud,
-  FileDown
+  FileDown,
+  Settings
 } from "lucide-react";
 
 // Recharts vectors for dashboard
@@ -99,6 +107,7 @@ import {
 
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
+import html2canvas from "html2canvas";
 
 // ==========================================
 // 1. Translation System Dictionary
@@ -127,10 +136,10 @@ const translations = {
     // Tabs
     tabPending: "যাচাইাধীন দান",
     tabManualIncome: "নগদ দান সংযুক্তি",
-    tabExpense: "মসজিদ খরচ সংযুক্তি",
+    tabExpense: "খরচসমূহ",
     tabNotice: "মসজিদ নোটিশ প্রকাশ",
-    tabSuperAdmin: "অ্যাডমিন ম্যানেজমেন্ট",
-    tabReports: "আর্থিক প্রতিবেদন ও রিপোর্ট",
+    tabSuperAdmin: "অ্যাক্সেস কন্ট্রোল",
+    tabReports: "প্রতিবেদন",
     tabAuditLogs: "অ্যাক্টিভিটি ও অডিট লগ",
 
     // Audit Queue
@@ -256,10 +265,10 @@ const translations = {
     // Tabs
     tabPending: "Pending Audits",
     tabManualIncome: "Manual Income",
-    tabExpense: "Expenses Form",
+    tabExpense: "Expenses",
     tabNotice: "Publish Notice",
-    tabSuperAdmin: "Admin Profiles",
-    tabReports: "Reports & Graphs",
+    tabSuperAdmin: "Access Control",
+    tabReports: "Reports",
     tabAuditLogs: "Accountability Logs",
 
     // Audit Queue
@@ -416,11 +425,12 @@ export default function AdminPage() {
   const [allAdmins, setAllAdmins] = useState<UserProfile[]>([]);
 
   // --- Filter states ---
-  const [reportsFilter, setReportsFilter] = useState<"weekly" | "monthly" | "yearly" | "custom">("monthly");
+  const [reportsFilter, setReportsFilter] = useState<"weekly" | "monthly" | "yearly" | "all" | "custom">("monthly");
   const [repStartDate, setRepStartDate] = useState("");
   const [repEndDate, setRepEndDate] = useState("");
   
   const [logFilterEmail, setLogFilterEmail] = useState("all");
+  const [logFilterAction, setLogFilterAction] = useState("all");
   const [logStartDate, setLogStartDate] = useState("");
   const [logEndDate, setLogEndDate] = useState("");
 
@@ -467,6 +477,18 @@ export default function AdminPage() {
 
   // --- Reporting PDF state ---
   const [downloadingPdf, setDownloadingPdf] = useState(false);
+  const [downloadingReceiptId, setDownloadingReceiptId] = useState<string | null>(null);
+
+  // --- Global settings, all donations, global search & PDF states ---
+  const [allDonations, setAllDonations] = useState<Donation[]>([]);
+  const [globalSettings, setGlobalSettings] = useState<SystemSettings | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [savingSettings, setSavingSettings] = useState(false);
+  const [presSigFile, setPresSigFile] = useState<File | null>(null);
+  const [treasSigFile, setTreasSigFile] = useState<File | null>(null);
+  const presSigInputRef = useRef<HTMLInputElement>(null);
+  const treasSigInputRef = useRef<HTMLInputElement>(null);
+  const [pdfReceiptData, setPdfReceiptData] = useState<Donation | null>(null);
 
   // --- Toast ---
   const [toast, setToast] = useState<{
@@ -533,80 +555,203 @@ export default function AdminPage() {
     return () => unsubscribe();
   }, [mounted, lang]);
 
-  // --- Load Admin Dashboard Data ---
-  const loadAdminData = async () => {
-    if (!user || !adminProfile) return;
-    try {
-      setLoading(true);
-      
-      // Load pending, approved cash donations, and rejected
-      const pendingList = await getDonations("pending");
-      setPendingDonations(pendingList);
+  // --- Live Data Listeners ---
+  useEffect(() => {
+    if (!mounted || !user || !adminProfile) return;
 
-      const rejectedList = await getDonations("rejected");
-      setRejectedDonations(rejectedList);
+    setLoading(true);
 
-      const allDonationsList = await getDonations("approved");
-      // filter manual cash donations
-      const cashList = allDonationsList.filter(d => d.paymentMethod === "cash");
-      setManualIncomes(cashList);
+    const localMapDonation = (docSnap: any): Donation => {
+      const data = docSnap.data();
+      return {
+        id: docSnap.id,
+        receiptId: data.receiptId || `REC-${docSnap.id.substring(0, 6).toUpperCase()}`,
+        donorName: data.donorName,
+        amount: Number(data.amount) || 0,
+        date: toDate(data.date),
+        trxId: data.trxId,
+        paymentMethod: data.paymentMethod,
+        category: data.category || "general_fund",
+        isAnonymous: !!data.isAnonymous,
+        status: data.status || "pending",
+      };
+    };
 
-      // Load expenses
-      const expenseList = await getExpenses();
-      setExpenses(expenseList);
+    const localMapExpense = (docSnap: any): Expense => {
+      const data = docSnap.data();
+      return {
+        id: docSnap.id,
+        category: data.category || "miscellaneous",
+        amount: Number(data.amount) || 0,
+        date: toDate(data.date),
+        description: data.description || "",
+        voucherUrl: data.voucherUrl || null,
+      };
+    };
 
-      // Load notices
-      const noticeList = await getNotices();
-      setNotices(noticeList);
+    const localMapNotice = (docSnap: any): Notice => {
+      const data = docSnap.data();
+      return {
+        id: docSnap.id,
+        title: data.title || "",
+        content: data.content || "",
+        date: toDate(data.date),
+      };
+    };
 
-      // Load stats based on reports time filters
-      let startDate: Date | undefined;
-      let endDate: Date | undefined;
-      const now = new Date();
+    const localMapAuditLog = (docSnap: any): AuditLog => {
+      const d = docSnap.data();
+      return {
+        id: docSnap.id,
+        adminEmail: d.adminEmail || "Unknown Admin",
+        actionType: d.actionType as any,
+        collectionName: d.collectionName as any,
+        details: d.details || "",
+        timestamp: toDate(d.timestamp),
+      };
+    };
 
-      if (reportsFilter === "weekly") {
-        startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-      } else if (reportsFilter === "monthly") {
-        startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-      } else if (reportsFilter === "yearly") {
-        startDate = new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000);
-      } else if (reportsFilter === "custom" && repStartDate) {
-        startDate = new Date(repStartDate);
-        if (repEndDate) endDate = new Date(repEndDate + "T23:59:59");
+    // 1. Donations Listener
+    const donationsCol = collection(db, "donations");
+    const unsubDonations = onSnapshot(donationsCol, (snapshot) => {
+      const list = snapshot.docs.map(localMapDonation);
+      setAllDonations(list);
+
+      // Filter pending donations
+      const pending = list.filter(d => d.status === "pending");
+      setPendingDonations(pending.sort((a, b) => b.date.getTime() - a.date.getTime()));
+
+      // Filter rejected donations
+      const rejected = list.filter(d => d.status === "rejected");
+      setRejectedDonations(rejected.sort((a, b) => b.date.getTime() - a.date.getTime()));
+
+      // Filter manual cash donations (approved cash)
+      const cashList = list.filter(d => d.paymentMethod === "cash" && d.status === "approved");
+      setManualIncomes(cashList.sort((a, b) => b.date.getTime() - a.date.getTime()));
+      setLoading(false);
+    }, (error) => {
+      console.error("Error listening to donations:", error);
+      setLoading(false);
+    });
+
+    // 2. Expenses Listener
+    const expensesCol = collection(db, "expenses");
+    const unsubExpenses = onSnapshot(expensesCol, (snapshot) => {
+      const list = snapshot.docs.map(localMapExpense);
+      setExpenses(list.sort((a, b) => b.date.getTime() - a.date.getTime()));
+    }, (error) => {
+      console.error("Error listening to expenses:", error);
+    });
+
+    // 3. Notices Listener
+    const noticesCol = collection(db, "notices");
+    const unsubNotices = onSnapshot(noticesCol, (snapshot) => {
+      const list = snapshot.docs.map(localMapNotice);
+      setNotices(list.sort((a, b) => b.date.getTime() - a.date.getTime()));
+    }, (error) => {
+      console.error("Error listening to notices:", error);
+    });
+
+    // 4. Settings Listener
+    const settingsDoc = doc(db, "settings", "global");
+    const unsubSettings = onSnapshot(settingsDoc, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        setGlobalSettings({
+          presidentSignatureUrl: data.presidentSignatureUrl || null,
+          treasurerSignatureUrl: data.treasurerSignatureUrl || null,
+        });
       }
+    });
 
-      const currentStats = await getDashboardStats(startDate, endDate);
-      setStats(currentStats);
+    // 5. Audit Logs Listener (only for superadmin)
+    let unsubAuditLogs = () => {};
+    if (adminProfile.role === "superadmin") {
+      const auditLogsCol = collection(db, "auditLogs");
+      unsubAuditLogs = onSnapshot(auditLogsCol, (snapshot) => {
+        const list = snapshot.docs.map(localMapAuditLog);
+        setAuditLogs(list.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime()));
+      }, (error) => {
+        console.error("Error listening to audit logs:", error);
+      });
+    }
 
-      // Load Audit Logs (if superadmin)
-      if (adminProfile.role === "superadmin") {
-        const logs = await getAuditLogs();
-        setAuditLogs(logs);
-
-        const usersCol = collection(db, "users");
-        const snapshot = await getDocs(usersCol);
-        const adminProfiles: UserProfile[] = snapshot.docs.map(doc => {
-          const d = doc.data();
+    // 6. Admins Profiles Listener (only for superadmin)
+    let unsubAdmins = () => {};
+    if (adminProfile.role === "superadmin") {
+      const usersCol = collection(db, "users");
+      unsubAdmins = onSnapshot(usersCol, (snapshot) => {
+        const adminProfiles: UserProfile[] = snapshot.docs.map(docSnap => {
+          const d = docSnap.data();
           return {
-            id: doc.id,
+            id: docSnap.id,
             email: d.email,
             role: d.role as UserRole
           };
         });
         setAllAdmins(adminProfiles);
-      }
-    } catch (error) {
-      console.error("Error loading admin dashboard datasets:", error);
-    } finally {
-      setLoading(false);
+      }, (error) => {
+        console.error("Error listening to admin profiles:", error);
+      });
     }
-  };
 
+    return () => {
+      unsubDonations();
+      unsubExpenses();
+      unsubNotices();
+      unsubSettings();
+      unsubAuditLogs();
+      unsubAdmins();
+    };
+  }, [mounted, user, adminProfile]);
+
+  // --- Real-time statistics calculator inside React memory ---
   useEffect(() => {
-    if (user && adminProfile) {
-      loadAdminData();
+    let startDate: Date | undefined = undefined;
+    let endDate: Date | undefined = undefined;
+    const now = new Date();
+
+    if (reportsFilter === "weekly") {
+      startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    } else if (reportsFilter === "monthly") {
+      startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    } else if (reportsFilter === "yearly") {
+      startDate = new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000);
+    } else if (reportsFilter === "custom" && repStartDate) {
+      startDate = new Date(repStartDate);
+      if (repEndDate) endDate = new Date(repEndDate + "T23:59:59");
     }
-  }, [user, adminProfile, activeTab, reportsFilter, repStartDate, repEndDate]);
+
+    let totalIncome = 0;
+    const incomeByCategory: Record<string, number> = {};
+    allDonations.forEach((d) => {
+      if (d.status !== "approved") return;
+      if (startDate && d.date < startDate) return;
+      if (endDate && d.date > endDate) return;
+      totalIncome += d.amount;
+      incomeByCategory[d.category] = (incomeByCategory[d.category] || 0) + d.amount;
+    });
+
+    let totalExpenses = 0;
+    const expenseByCategory: Record<string, number> = {};
+    expenses.forEach((e) => {
+      if (startDate && e.date < startDate) return;
+      if (endDate && e.date > endDate) return;
+      totalExpenses += e.amount;
+      expenseByCategory[e.category] = (expenseByCategory[e.category] || 0) + e.amount;
+    });
+
+    setStats({
+      totalIncome,
+      totalExpenses,
+      netBalance: totalIncome - totalExpenses,
+      incomeByCategory,
+      expenseByCategory,
+    });
+  }, [allDonations, expenses, reportsFilter, repStartDate, repEndDate]);
+
+  // Keep as a safe mock dummy function for backwards compatibility with historical handlers
+  const loadAdminData = async () => {};
 
   // --- Handle Login ---
   const handleLogin = async (e: React.FormEvent) => {
@@ -800,8 +945,19 @@ export default function AdminPage() {
 
       triggerToast("success", t.saveSuccess, t.saveSuccess);
       await loadAdminData();
-    } catch (err) {
-      triggerToast("error", t.saveError, t.saveError);
+    } catch (err: any) {
+      console.error("Error adding expense:", err);
+      if (err.message && (err.message.includes("Storage") || err.message.includes("timeout") || err.message.includes("permission") || err.message.includes("unauthorized"))) {
+        triggerToast(
+          "error",
+          lang === "bn" ? "ভাউচার আপলোড ব্যর্থতা!" : "Storage Upload Failed",
+          lang === "bn"
+            ? "ফাইল আপলোড ব্যর্থ হয়েছে! এটি স্টোরেজ সিকিউরিটি রুলস (Write Denied) অথবা নেটওয়ার্ক টাইমআউটের কারণে হতে পারে।"
+            : "Firebase Storage upload failed: Permission Denied by security rules or upload timed out (12s limit reached)."
+        );
+      } else {
+        triggerToast("error", t.saveError, t.saveError);
+      }
     } finally {
       setSubmitting(false);
     }
@@ -859,6 +1015,163 @@ export default function AdminPage() {
     }
   };
 
+  // --- html2canvas-based dynamic Cash Receipt Generator ---
+  const handleDownloadReceiptPdfDirectly = async (d: Donation) => {
+    if (!mounted) return;
+    setDownloadingReceiptId(d.id || null);
+
+    triggerToast(
+      "success",
+      lang === "bn" ? "রশিদ প্রস্তুত হচ্ছে..." : "Preparing Receipt...",
+      lang === "bn" ? "অনুগ্রহ করে কিছুক্ষণ অপেক্ষা করুন।" : "Please wait while we render your receipt."
+    );
+
+    try {
+      setPdfReceiptData(d);
+      await new Promise((resolve) => setTimeout(resolve, 350)); // let DOM paint
+
+      const element = document.getElementById("receipt-pdf-template");
+      if (!element) throw new Error("Receipt template container not found!");
+
+      const canvas = await html2canvas(element, {
+        scale: 2,
+        useCORS: true,
+        logging: false,
+        backgroundColor: "#ffffff"
+      });
+
+      const imgData = canvas.toDataURL("image/png");
+
+      const pdf = new jsPDF({
+        orientation: "portrait",
+        unit: "mm",
+        format: "a5"
+      });
+
+      pdf.addImage(imgData, "PNG", 0, 0, 148, 210);
+      pdf.save(`Masjid-CashReceipt-${d.receiptId || d.id?.substring(0, 6).toUpperCase() || "CASH"}.pdf`);
+
+      triggerToast(
+        "success",
+        lang === "bn" ? "রশিদ ডাউনলোড সম্পন্ন হয়েছে!" : "Generated Successfully",
+        lang === "bn" ? "আপনার দান রশিদটি সফলভাবে সংরক্ষণ করা হয়েছে।" : "Donation receipt has been successfully saved."
+      );
+    } catch (error) {
+      console.error("Receipt generation failed:", error);
+      triggerToast("error", lang === "bn" ? "রশিদ প্রস্তুতকরণে ব্যর্থতা!" : "Download Failed", lang === "bn" ? "রশিদ পিডিএফ জেনারেট করতে সমস্যা হয়েছে।" : "Failed to compile the receipt PDF.");
+    } finally {
+      setDownloadingReceiptId(null);
+    }
+  };
+
+  // --- html2canvas-based Dynamic A4 Statement Generator ---
+  const handleDownloadPdfReport = async () => {
+    if (!mounted) return;
+    setDownloadingPdf(true);
+
+    triggerToast(
+      "success",
+      lang === "bn" ? "বিবরণী প্রস্তুত হচ্ছে..." : "Preparing Statement...",
+      lang === "bn" ? "অনুগ্রহ করে কিছুক্ষণ অপেক্ষা করুন।" : "Generating pixel-perfect PDF statement."
+    );
+
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 400)); // let DOM paint
+
+      const element = document.getElementById("statement-pdf-template");
+      if (!element) throw new Error("Statement template container not found!");
+
+      const canvas = await html2canvas(element, {
+        scale: 2,
+        useCORS: true,
+        logging: false,
+        backgroundColor: "#ffffff"
+      });
+
+      const imgData = canvas.toDataURL("image/png");
+
+      const pdf = new jsPDF({
+        orientation: "portrait",
+        unit: "mm",
+        format: "a4"
+      });
+
+      pdf.addImage(imgData, "PNG", 0, 0, 210, 297);
+      
+      const startFmt = repStartDate ? repStartDate : "Inception";
+      const endFmt = repEndDate ? repEndDate : new Date().toLocaleDateString("en-US");
+      pdf.save(`Masjid-Statement-${startFmt}-${endFmt}.pdf`);
+
+      triggerToast(
+        "success",
+        lang === "bn" ? "বিবরণী ডাউনলোড সম্পন্ন হয়েছে!" : "Generated Successfully",
+        lang === "bn" ? "আর্থিক বিবরণী বিবরণ সফলভাবে সংরক্ষণ করা হয়েছে।" : "Mosque financial statement report saved successfully."
+      );
+    } catch (error) {
+      console.error("Statement generation failed:", error);
+      triggerToast("error", lang === "bn" ? "বিবরণী প্রস্তুতকরণে ব্যর্থতা!" : "Download Failed", lang === "bn" ? "বিবরণী পিডিএফ জেনারেট করতে সমস্যা হয়েছে।" : "Failed to compile the statement PDF.");
+    } finally {
+      setDownloadingPdf(false);
+    }
+  };
+
+  // --- Upload and Update Signature Settings ---
+  const handleSaveSignatures = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!adminProfile || adminProfile.role !== "superadmin") return;
+
+    try {
+      setSavingSettings(true);
+      let presidentSignatureUrl = globalSettings?.presidentSignatureUrl || null;
+      let treasurerSignatureUrl = globalSettings?.treasurerSignatureUrl || null;
+
+      if (presSigFile) {
+        if (presSigFile.size > 500 * 1024) {
+          triggerToast("error", t.saveError, lang === "bn" ? "সভাপতির স্বাক্ষর ৫০০KB এর বেশি হতে পারবে না!" : "President signature must be < 500KB!");
+          setSavingSettings(false);
+          return;
+        }
+        presidentSignatureUrl = await uploadVoucherImage(presSigFile);
+      }
+
+      if (treasSigFile) {
+        if (treasSigFile.size > 500 * 1024) {
+          triggerToast("error", t.saveError, lang === "bn" ? "ক্যাশিয়ারের স্বাক্ষর ৫০০KB এর বেশি হতে পারবে না!" : "Treasurer signature must be < 500KB!");
+          setSavingSettings(false);
+          return;
+        }
+        treasurerSignatureUrl = await uploadVoucherImage(treasSigFile);
+      }
+
+      await updateSystemSettings({
+        presidentSignatureUrl,
+        treasurerSignatureUrl
+      });
+
+      setPresSigFile(null);
+      setTreasSigFile(null);
+      if (presSigInputRef.current) presSigInputRef.current.value = "";
+      if (treasSigInputRef.current) treasSigInputRef.current.value = "";
+
+      triggerToast("success", t.saveSuccess, lang === "bn" ? "স্বাক্ষর সফলভাবে সংরক্ষিত হয়েছে!" : "Signatures saved successfully!");
+    } catch (err: any) {
+      console.error("Error saving signatures:", err);
+      if (err.message && (err.message.includes("Storage") || err.message.includes("timeout") || err.message.includes("permission") || err.message.includes("unauthorized"))) {
+        triggerToast(
+          "error",
+          lang === "bn" ? "স্বাক্ষর আপলোড ব্যর্থতা!" : "Signature Upload Failed",
+          lang === "bn"
+            ? "ডিজিটাল স্বাক্ষর ফাইল আপলোড করতে সমস্যা হয়েছে! এটি ফায়ারবেস সিকিউরিটি রুলস বা টাইমআউটের কারণে হতে পারে।"
+            : "Firebase Storage error: Upload timed out or writes are denied by security rules. Please check your storage bucket rules."
+        );
+      } else {
+        triggerToast("error", t.saveError, lang === "bn" ? "সংরক্ষণ করতে সমস্যা হয়েছে!" : "Failed to save signatures!");
+      }
+    } finally {
+      setSavingSettings(false);
+    }
+  };
+
   // --- SuperAdmin: Remove Admin Role ---
   const handleRemoveAdmin = async (adminId: string, email: string) => {
     if (email.toLowerCase() === "superadmin@masjid.com" || email.toLowerCase() === adminProfile?.email.toLowerCase()) {
@@ -886,7 +1199,9 @@ export default function AdminPage() {
     
     try {
       setSubmitting(true);
-      await updateDonation(editingDonation.id, editingDonation, adminProfile.email);
+      const payload = { ...editingDonation };
+      delete payload.id;
+      await updateDonation(editingDonation.id, payload, adminProfile.email);
       triggerToast("success", t.saveSuccess, t.saveSuccess);
       setEditingDonation(null);
       await loadAdminData();
@@ -903,7 +1218,9 @@ export default function AdminPage() {
 
     try {
       setSubmitting(true);
-      await updateExpense(editingExpense.id, editingExpense, adminProfile.email);
+      const payload = { ...editingExpense };
+      delete payload.id;
+      await updateExpense(editingExpense.id, payload, adminProfile.email);
       triggerToast("success", t.saveSuccess, t.saveSuccess);
       setEditingExpense(null);
       await loadAdminData();
@@ -920,7 +1237,9 @@ export default function AdminPage() {
 
     try {
       setSubmitting(true);
-      await updateNotice(editingNotice.id, editingNotice, adminProfile.email);
+      const payload = { ...editingNotice };
+      delete payload.id;
+      await updateNotice(editingNotice.id, payload, adminProfile.email);
       triggerToast("success", t.saveSuccess, t.saveSuccess);
       setEditingNotice(null);
       await loadAdminData();
@@ -980,218 +1299,6 @@ export default function AdminPage() {
     }
   };
 
-  // --- Dynamic Cash Receipt Generator ---
-  const handleDownloadReceiptPdfDirectly = (d: Donation) => {
-    const doc = new jsPDF({
-      orientation: "portrait",
-      unit: "mm",
-      format: "a5"
-    });
-
-    doc.setFillColor(4, 120, 87); 
-    doc.rect(0, 0, 148, 25, "F");
-
-    doc.setTextColor(255, 255, 255);
-    doc.setFont("Helvetica", "bold");
-    doc.setFontSize(14);
-    doc.text("Subedar Jame Masjid Al Khawari", 74, 10, { align: "center" });
-
-    doc.setFont("Helvetica", "normal");
-    doc.setFontSize(8);
-    doc.text("South Mirer Khil, Hathazari, Chattogram", 74, 15, { align: "center" });
-    doc.text("Cash Donation Voucher Receipt", 74, 19, { align: "center" });
-
-    doc.setTextColor(30, 41, 59);
-    doc.setFont("Helvetica", "bold");
-    doc.setFontSize(11);
-    doc.text("OFFICIAL CASH RECEIPT", 74, 38, { align: "center" });
-
-    doc.setDrawColor(226, 232, 240);
-    doc.line(15, 42, 133, 42);
-
-    const drawRow = (label: string, value: string, y: number) => {
-      doc.setFont("Helvetica", "bold");
-      doc.setTextColor(100, 116, 139);
-      doc.text(label, 20, y);
-      doc.setFont("Helvetica", "normal");
-      doc.setTextColor(15, 23, 42);
-      doc.text(value, 60, y);
-    };
-
-    const formattedDate = formatDate(d.date || new Date(), "en");
-    const formattedCategory = translateCategory(d.category, "en");
-
-    drawRow("Receipt ID:", `REC-CASH-${d.id?.substring(0, 5).toUpperCase() || "NEW"}`, 52);
-    drawRow("Date:", formattedDate, 60);
-    drawRow("Donor Name:", d.isAnonymous ? "Anonymous Donor (Nam Prokash e Onicchuk)" : d.donorName || "Anonymous", 68);
-    drawRow("Category:", formattedCategory, 76);
-    drawRow("Method:", "CASH (Commit Handover)", 84);
-    
-    doc.setFillColor(240, 253, 250);
-    doc.rect(20, 92, 108, 14, "F");
-    doc.setDrawColor(204, 251, 241);
-    doc.rect(20, 92, 108, 14, "S");
-
-    doc.setFont("Helvetica", "bold");
-    doc.setFontSize(10);
-    doc.setTextColor(5, 150, 105);
-    doc.text("TOTAL AMOUNT RECEIVED:", 25, 101);
-    doc.setFontSize(11);
-    doc.text(`BDT ${d.amount.toLocaleString()}.00`, 85, 101);
-
-    doc.setFillColor(220, 252, 231);
-    doc.rect(54, 112, 40, 7, "F");
-    doc.setFont("Helvetica", "bold");
-    doc.setFontSize(7.5);
-    doc.setTextColor(21, 128, 61);
-    doc.text("VERIFIED & CASH RECEIVED", 74, 117, { align: "center" });
-
-    doc.setFont("Helvetica", "normal");
-    doc.setFontSize(7);
-    doc.setTextColor(100, 116, 139);
-    doc.line(20, 165, 55, 165);
-    doc.text("Treasurer Signature", 37, 169, { align: "center" });
-    doc.line(93, 165, 128, 165);
-    doc.text("Committee President", 110, 169, { align: "center" });
-
-    doc.setFillColor(248, 250, 252);
-    doc.rect(0, 185, 148, 15, "F");
-    doc.text("Thank you for your donation. JazakAllahu Khairan.", 74, 191, { align: "center" });
-    doc.text("Subedar Jame Masjid Al Khawari transparent finance board.", 74, 194, { align: "center" });
-
-    doc.save(`Masjid-CashReceipt-${d.id?.substring(0, 5).toUpperCase() || "NEW"}.pdf`);
-  };
-
-  // --- Real PDF Statement Generation ---
-  const handleDownloadPdfReport = () => {
-    setDownloadingPdf(true);
-    try {
-      const doc = new jsPDF({
-        orientation: "portrait",
-        unit: "mm",
-        format: "a4"
-      });
-
-      // Cover top details
-      doc.setFillColor(6, 78, 59);
-      doc.rect(0, 0, 210, 30, "F");
-
-      doc.setTextColor(255, 255, 255);
-      doc.setFont("Helvetica", "bold");
-      doc.setFontSize(16);
-      doc.text("Subedar Jame Masjid Al Khawari", 105, 11, { align: "center" });
-      
-      doc.setFont("Helvetica", "normal");
-      doc.setFontSize(9);
-      doc.text("South Mirer Khil, Hathazari, Chattogram, Bangladesh", 105, 17, { align: "center" });
-      
-      const startFmt = repStartDate ? formatDate(new Date(repStartDate), "en") : "Inception";
-      const endFmt = repEndDate ? formatDate(new Date(repEndDate), "en") : formatDate(new Date(), "en");
-      doc.text(`Official Financial Statement Report: ${startFmt} - ${endFmt}`, 105, 23, { align: "center" });
-
-      // Statement Overview Cards
-      doc.setTextColor(15, 23, 42);
-      doc.setFont("Helvetica", "bold");
-      doc.setFontSize(11);
-      doc.text("FINANCIAL POSITION OVERVIEW", 15, 42);
-
-      // Income Card
-      doc.setFillColor(240, 253, 250);
-      doc.rect(15, 47, 56, 20, "F");
-      doc.setDrawColor(204, 251, 241);
-      doc.rect(15, 47, 56, 20, "S");
-      doc.setTextColor(13, 148, 136);
-      doc.setFontSize(8);
-      doc.text("TOTAL COLLECTIONS", 19, 53);
-      doc.setFontSize(12);
-      doc.text(formatCurrency(stats.totalIncome, "en"), 19, 61);
-
-      // Expenses Card
-      doc.setFillColor(254, 242, 242);
-      doc.rect(77, 47, 56, 20, "F");
-      doc.setDrawColor(254, 226, 226);
-      doc.rect(77, 47, 56, 20, "S");
-      doc.setTextColor(239, 68, 68);
-      doc.setFontSize(8);
-      doc.text("TOTAL EXPENSES", 81, 53);
-      doc.setFontSize(12);
-      doc.text(formatCurrency(stats.totalExpenses, "en"), 81, 61);
-
-      // Balance Card
-      doc.setFillColor(243, 244, 246);
-      doc.rect(139, 47, 56, 20, "F");
-      doc.setDrawColor(229, 231, 235);
-      doc.rect(139, 47, 56, 20, "S");
-      doc.setTextColor(75, 85, 99);
-      doc.setFontSize(8);
-      doc.text("NET AVAILABLE BALANCE", 143, 53);
-      doc.setFontSize(12);
-      doc.text(formatCurrency(stats.netBalance, "en"), 143, 61);
-
-      // Category breakdowns table using autotable
-      doc.setTextColor(15, 23, 42);
-      doc.setFont("Helvetica", "bold");
-      doc.setFontSize(10);
-      doc.text("Collections Distribution By Category", 15, 78);
-
-      const incomeRows = Object.entries(stats.incomeByCategory).map(([cat, amt]) => [
-        translateCategory(cat, "en"),
-        "Approved Ledger Collections",
-        formatCurrency(amt, "en")
-      ]);
-
-      autoTable(doc, {
-        startY: 82,
-        head: [["Donation Category", "Description", "BDT Amount"]],
-        body: incomeRows.length > 0 ? incomeRows : [["N/A", "No records found in range", "৳ 0"]],
-        theme: "striped",
-        headStyles: { fillColor: [4, 120, 87] },
-        styles: { fontSize: 8.5 }
-      });
-
-      const nextStartY = (doc as any).lastAutoTable.finalY + 12;
-      doc.text("Expenses Distribution By Category", 15, nextStartY - 4);
-
-      const expRows = Object.entries(stats.expenseByCategory).map(([cat, amt]) => [
-        translateCategory(cat, "en"),
-        "Official Mosque Expenditures",
-        formatCurrency(amt, "en")
-      ]);
-
-      autoTable(doc, {
-        startY: nextStartY,
-        head: [["Expense Category", "Description", "BDT Amount"]],
-        body: expRows.length > 0 ? expRows : [["N/A", "No records found in range", "৳ 0"]],
-        theme: "striped",
-        headStyles: { fillColor: [185, 28, 28] },
-        styles: { fontSize: 8.5 }
-      });
-
-      // Signature blocks
-      const sigStartY = (doc as any).lastAutoTable.finalY + 28;
-      doc.setFont("Helvetica", "normal");
-      doc.setFontSize(8);
-      doc.setTextColor(100, 116, 139);
-
-      doc.line(15, sigStartY, 60, sigStartY);
-      doc.text("Treasurer Cashier", 37, sigStartY + 4, { align: "center" });
-
-      doc.line(150, sigStartY, 195, sigStartY);
-      doc.text("Committee President", 172, sigStartY + 4, { align: "center" });
-
-      doc.setFontSize(7);
-      doc.text(`This statement was generated electronically by ${adminProfile?.email || "Admin"} on ${new Date().toLocaleString()}.`, 15, sigStartY + 15);
-
-      doc.save(`Masjid-Statement-${reportsFilter.toUpperCase()}.pdf`);
-      triggerToast("success", lang === "bn" ? "ডাউনলোড সফল!" : "Download Success!", t.pdfSuccessToast);
-    } catch (error) {
-      console.error("PDF generation failed:", error);
-      triggerToast("error", t.saveError, "Failed to compile BDT PDF.");
-    } finally {
-      setDownloadingPdf(false);
-    }
-  };
-
   // Safe SSR gate while mounting
   if (!mounted) {
     return (
@@ -1215,8 +1322,43 @@ export default function AdminPage() {
   // Filtering audit logs inside the client visually
   const filteredAuditLogs = auditLogs.filter(log => {
     if (logFilterEmail !== "all" && log.adminEmail.toLowerCase() !== logFilterEmail.toLowerCase()) return false;
+    if (logFilterAction !== "all" && log.actionType.toLowerCase() !== logFilterAction.toLowerCase()) return false;
     if (logStartDate && log.timestamp < new Date(logStartDate)) return false;
     if (logEndDate && log.timestamp > new Date(logEndDate + "T23:59:59")) return false;
+    return true;
+  });
+
+  // Derived state: Filtered approved donations & expenses by reports date range
+  const getReportsDateRange = () => {
+    let startDate: Date | undefined = undefined;
+    let endDate: Date | undefined = undefined;
+    const now = new Date();
+
+    if (reportsFilter === "weekly") {
+      startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    } else if (reportsFilter === "monthly") {
+      startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    } else if (reportsFilter === "yearly") {
+      startDate = new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000);
+    } else if (reportsFilter === "custom" && repStartDate) {
+      startDate = new Date(repStartDate);
+      if (repEndDate) endDate = new Date(repEndDate + "T23:59:59");
+    }
+    return { startDate, endDate };
+  };
+
+  const { startDate: reportStart, endDate: reportEnd } = getReportsDateRange();
+
+  const filteredApprovedDonationsForReport = allDonations.filter((d) => {
+    if (d.status !== "approved") return false;
+    if (reportStart && d.date < reportStart) return false;
+    if (reportEnd && d.date > reportEnd) return false;
+    return true;
+  });
+
+  const filteredExpensesForReport = expenses.filter((e) => {
+    if (reportStart && e.date < reportStart) return false;
+    if (reportEnd && e.date > reportEnd) return false;
     return true;
   });
 
@@ -1439,6 +1581,16 @@ export default function AdminPage() {
                 <span>{t.tabReports}</span>
               </button>
 
+              <button
+                onClick={() => setActiveTab("receipt_verification")}
+                className={`w-full py-3 px-3 rounded-2xl text-xs font-bold transition-all text-left flex items-center gap-2.5 cursor-pointer ${
+                  activeTab === "receipt_verification" ? "bg-emerald-50 text-emerald-800 shadow-inner" : "text-slate-600 hover:bg-gray-50"
+                }`}
+              >
+                <Search className="w-4.5 h-4.5 shrink-0" />
+                <span>{lang === "bn" ? "রশিদ যাচাইকরণ" : "Receipt Verification"}</span>
+              </button>
+
               {/* SuperAdmin Gated Sidebar selectors */}
               {adminProfile?.role === "superadmin" && (
                 <>
@@ -1461,6 +1613,16 @@ export default function AdminPage() {
                     <Users className="w-4.5 h-4.5 shrink-0 text-emerald-800" />
                     <span>{t.tabSuperAdmin}</span>
                   </button>
+
+                  <button
+                    onClick={() => setActiveTab("settings")}
+                    className={`w-full py-3 px-3 rounded-2xl text-xs font-bold transition-all text-left flex items-center gap-2.5 cursor-pointer ${
+                      activeTab === "settings" ? "bg-emerald-50 text-emerald-800 shadow-inner" : "text-slate-600 hover:bg-gray-50"
+                    }`}
+                  >
+                    <Settings className="w-4.5 h-4.5 shrink-0 text-emerald-800" />
+                    <span>{lang === "bn" ? "স্বাক্ষরসমূহ" : "Signatures"}</span>
+                  </button>
                 </>
               )}
 
@@ -1471,6 +1633,207 @@ export default function AdminPage() {
           <section className="md:col-span-3">
             <div className="bg-white rounded-3xl p-6 border border-emerald-100/40 shadow-xl shadow-emerald-950/5 min-h-[460px]">
               
+              {/* ========================================================
+                  TAB: RECEIPT VERIFICATION (Global Quick Lookup Panel)
+                  ======================================================== */}
+              {activeTab === "receipt_verification" && (
+                <div className="space-y-6 animate-fadeIn">
+                  <div className="border-b border-gray-150 pb-4 mb-4">
+                    <h2 className="text-base sm:text-lg font-extrabold text-slate-900 flex items-center gap-1.5">
+                      <Search className="w-5.5 h-5.5 text-emerald-600" />
+                      <span>{lang === "bn" ? "রশিদ যাচাইকরণ" : "Receipt Verification"}</span>
+                    </h2>
+                    <p className="text-xs text-slate-500 mt-1 font-semibold">
+                      {lang === "bn"
+                        ? "যেকোনো দান বা ক্যাশ রশিদের আইডি (যেমন: REC-XXXXXX) দিয়ে সরাসরি তথ্য খুঁজুন"
+                        : "Find any automated or cash receipt details using receipt ID (e.g. REC-XXXXXX)"}
+                    </p>
+                  </div>
+
+                  <div className="p-4 rounded-3xl bg-slate-50 border border-slate-200/60 shadow-inner flex flex-col gap-4">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                      <div className="flex items-center gap-2">
+                        <Search className="w-5 h-5 text-emerald-600 shrink-0" />
+                        <div>
+                          <h3 className="text-xs font-black uppercase text-slate-800 tracking-wider">
+                            {lang === "bn" ? "রশিদ আইডি অনুসন্ধান" : "Receipt ID Quick Lookup"}
+                          </h3>
+                          <p className="text-[10px] text-slate-500 font-semibold mt-0.5">
+                            {lang === "bn"
+                              ? "যেকোনো দান বা ক্যাশ রশিদের আইডি (যেমন: REC-XXXXXX) দিয়ে সরাসরি তথ্য খুঁজুন"
+                              : "Find any automated or cash receipt details using receipt ID (e.g. REC-XXXXXX)"}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="relative max-w-xs w-full">
+                        <input
+                          type="text"
+                          placeholder={lang === "bn" ? "রশিদ আইডি (যেমন: REC-A7B8C9)..." : "Receipt ID (e.g., REC-A7B8C9)..."}
+                          value={searchQuery}
+                          onChange={(e) => setSearchQuery(e.target.value)}
+                          className="w-full pl-9 pr-4 py-2 text-xs font-semibold bg-white border border-slate-200 rounded-2xl focus:outline-none focus:ring-2 focus:ring-emerald-500 placeholder-slate-400 text-slate-800 transition-all shadow-sm"
+                        />
+                        <Search className="absolute left-3 top-2.5 w-4 h-4 text-slate-400" />
+                        {searchQuery && (
+                          <button
+                            onClick={() => setSearchQuery("")}
+                            className="absolute right-3 top-2.5 w-4 h-4 rounded-full hover:bg-slate-100 flex items-center justify-center text-slate-400 hover:text-slate-600 cursor-pointer"
+                          >
+                            <X className="w-3 h-3" />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Display matched record in a premium card */}
+                    {searchQuery.trim() !== "" && (() => {
+                      const cleanedQuery = searchQuery.trim().toUpperCase();
+                      const matchedRecord = allDonations.find(
+                        (d) => d.receiptId?.toUpperCase() === cleanedQuery || d.id?.toUpperCase() === cleanedQuery
+                      );
+
+                      if (!matchedRecord) {
+                        return (
+                          <div className="p-3.5 text-center bg-white border border-dashed border-slate-200 rounded-2xl text-xs font-bold text-slate-400 flex items-center justify-center gap-1.5 animate-pulse">
+                            <AlertCircle className="w-4 h-4 text-amber-500 shrink-0" />
+                            <span>
+                              {lang === "bn"
+                                ? "কোনো ম্যাচিং রশিদ খুঁজে পাওয়া যায়নি।"
+                                : "No matching transaction record found."}
+                            </span>
+                          </div>
+                        );
+                      }
+
+                      return (
+                        <div className="p-4 rounded-2xl bg-white border border-emerald-100 shadow-sm relative overflow-hidden transition-all hover:shadow-md animate-fadeIn">
+                          {/* Background branding badge */}
+                          <div className="absolute top-0 right-0 transform translate-x-4 -translate-y-4 w-28 h-28 bg-emerald-50/30 rounded-full blur-xl pointer-events-none"></div>
+
+                          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 relative">
+                            <div className="space-y-2">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className="text-[10px] font-black uppercase bg-emerald-50 text-emerald-800 px-2 py-0.5 rounded-full border border-emerald-100/80">
+                                  {matchedRecord.receiptId}
+                                </span>
+                                <span className={`text-[10px] font-black uppercase px-2 py-0.5 rounded-full border ${
+                                  matchedRecord.status === "approved"
+                                    ? "bg-emerald-50 text-emerald-700 border-emerald-150"
+                                    : matchedRecord.status === "pending"
+                                    ? "bg-amber-50 text-amber-700 border-amber-150"
+                                    : "bg-red-50 text-red-700 border-red-150"
+                                }`}>
+                                  {matchedRecord.status === "approved"
+                                    ? (lang === "bn" ? "অনুমোদিত" : "Approved")
+                                    : matchedRecord.status === "pending"
+                                    ? (lang === "bn" ? "যাচাইাধীন" : "Pending Review")
+                                    : (lang === "bn" ? "প্রত্যাখ্যাত" : "Rejected")}
+                                </span>
+                              </div>
+
+                              <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-6 gap-y-1.5 text-xs">
+                                <div>
+                                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide">
+                                    {lang === "bn" ? "দাতার নাম" : "Donor Name"}
+                                  </p>
+                                  <p className="font-extrabold text-slate-900 mt-0.5">
+                                    {matchedRecord.isAnonymous ? (lang === "bn" ? "নাম প্রকাশে অনিচ্ছুক" : "Anonymous Donor") : matchedRecord.donorName || (lang === "bn" ? "নাম প্রকাশে অনিচ্ছুক" : "Anonymous Donor")}
+                                  </p>
+                                </div>
+                                <div>
+                                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide">
+                                    {lang === "bn" ? "দানের পরিমাণ" : "Donation Amount"}
+                                  </p>
+                                  <p className="font-black text-slate-950 mt-0.5">
+                                    {formatCurrency(matchedRecord.amount, lang)}
+                                  </p>
+                                </div>
+                                <div>
+                                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide">
+                                    {lang === "bn" ? "দানের খাত" : "Category"}
+                                  </p>
+                                  <p className="font-bold text-emerald-800 mt-0.5">
+                                    {translateCategory(matchedRecord.category, lang)}
+                                  </p>
+                                </div>
+                                <div>
+                                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide">
+                                    {lang === "bn" ? "পেমেন্ট মাধ্যম" : "Payment Method"}
+                                  </p>
+                                  <p className="font-bold text-slate-500 uppercase mt-0.5 text-[10px]">
+                                    {matchedRecord.paymentMethod} {matchedRecord.trxId && `(TrxID: ${matchedRecord.trxId})`}
+                                  </p>
+                                </div>
+                              </div>
+                            </div>
+
+                            {/* Action buttons on matched card */}
+                            <div className="flex items-center gap-2 shrink-0">
+                              {matchedRecord.status === "pending" && (
+                                <>
+                                  <button
+                                    onClick={async () => {
+                                      await handleApproveDonation(matchedRecord.id!);
+                                    }}
+                                    disabled={submitting}
+                                    className="px-2.5 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[10px] flex items-center gap-1 transition-all shadow-sm active:scale-95 cursor-pointer disabled:opacity-50"
+                                  >
+                                    <Check className="w-3.5 h-3.5" />
+                                    <span>{lang === "bn" ? "অনুমোদন করুন" : "Approve"}</span>
+                                  </button>
+                                  <button
+                                    onClick={() => {
+                                      setClaimEditTarget(matchedRecord);
+                                      setClaimEditAmount(matchedRecord.amount.toString());
+                                    }}
+                                    disabled={submitting}
+                                    className="px-2.5 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold text-[10px] flex items-center gap-1 transition-all active:scale-95 cursor-pointer disabled:opacity-50"
+                                  >
+                                    <Edit className="w-3.5 h-3.5" />
+                                    <span>{lang === "bn" ? "টাকা সংশোধন" : "Edit Amount"}</span>
+                                  </button>
+                                  <button
+                                    onClick={async () => {
+                                      await handleRejectDonation(matchedRecord.id!);
+                                    }}
+                                    disabled={submitting}
+                                    className="px-2.5 py-1.5 rounded-xl bg-red-50 hover:bg-red-100 text-red-700 font-bold text-[10px] flex items-center gap-1 transition-all active:scale-95 cursor-pointer disabled:opacity-50"
+                                  >
+                                    <X className="w-3.5 h-3.5" />
+                                    <span>{lang === "bn" ? "প্রত্যাখ্যান" : "Reject"}</span>
+                                  </button>
+                                </>
+                              )}
+                              {matchedRecord.status === "approved" && (
+                                <button
+                                  onClick={async () => {
+                                    await handleDownloadReceiptPdfDirectly(matchedRecord);
+                                  }}
+                                  disabled={downloadingReceiptId !== null}
+                                  className="px-3 py-2 rounded-xl bg-slate-900 hover:bg-black text-white font-bold text-[10px] flex items-center gap-1.5 transition-all shadow-sm active:scale-95 cursor-pointer disabled:opacity-50"
+                                >
+                                  {downloadingReceiptId === matchedRecord.id ? (
+                                    <>
+                                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                      <span>{lang === "bn" ? "ডাউনলোড হচ্ছে..." : "Downloading..."}</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <FileDown className="w-3.5 h-3.5" />
+                                      <span>{lang === "bn" ? "রশিদ ডাউনলোড" : "Download PDF"}</span>
+                                    </>
+                                  )}
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })()}
+                  </div>
+                </div>
+              )}
+
               {/* ========================================================
                   TAB 1: PENDING AUDIT LOGS & REJECTED CLAIMS
                   ======================================================== */}
@@ -2054,82 +2417,70 @@ export default function AdminPage() {
                   ======================================================== */}
               {activeTab === "reports" && (
                 <div className="space-y-6">
-                  <div className="border-b border-gray-150 pb-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                  <div className="border-b border-gray-150 pb-4 flex flex-col xl:flex-row xl:items-center xl:justify-between gap-4">
                     <div>
                       <h2 className="text-base sm:text-lg font-extrabold text-slate-900">{t.reportsTitle}</h2>
                       <p className="text-xs text-slate-500 mt-1 font-semibold">{t.reportsDesc}</p>
                     </div>
 
-                    {/* PDF statement action trigger */}
-                    <button
-                      onClick={handleDownloadPdfReport}
-                      disabled={downloadingPdf}
-                      className="px-4 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs transition-all active:scale-[0.99] disabled:opacity-50 flex items-center justify-center gap-1.5 cursor-pointer shadow-md shrink-0 self-start"
-                    >
-                      {downloadingPdf ? (
-                        <>
-                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                          <span>{t.downloadingPdfBtn}</span>
-                        </>
-                      ) : (
-                        <>
-                          <FileText className="w-4 h-4 text-emerald-300" />
-                          <span>{t.downloadPdfBtn}</span>
-                        </>
-                      )}
-                    </button>
-                  </div>
-
-                  {/* Dynamic Date Filtering Dashboard */}
-                  <div className="p-4 bg-gray-50 border border-gray-150 rounded-2xl space-y-3">
-                    <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs">
-                      <div className="flex items-center gap-2">
-                        <Calendar className="w-4 h-4 text-emerald-600" />
-                        <span className="font-extrabold text-slate-700">{t.filterLabel}</span>
-                      </div>
-                      
-                      <div className="flex flex-wrap gap-1.5">
-                        {(["weekly", "monthly", "yearly", "custom"] as const).map((filter) => (
+                    {/* Filters and PDF statement action trigger side-by-side */}
+                    <div className="flex flex-col sm:flex-row sm:items-center gap-3 self-stretch xl:self-auto flex-wrap">
+                      <div className="flex flex-wrap gap-1">
+                        {(["weekly", "monthly", "yearly", "all", "custom"] as const).map((filter) => (
                           <button
                             key={filter}
                             onClick={() => setReportsFilter(filter)}
-                            className={`px-3 py-1.5 rounded-lg font-bold transition-all cursor-pointer ${
+                            className={`px-2.5 py-1.5 rounded-lg text-[10px] font-black transition-all cursor-pointer ${
                               reportsFilter === filter
-                                ? "bg-emerald-600 text-white shadow-sm"
-                                : "bg-white text-slate-600 hover:bg-gray-150 border border-gray-200"
+                                ? "bg-emerald-600 text-white shadow-sm border border-emerald-650"
+                                : "bg-slate-50 hover:bg-slate-100 text-slate-600 border border-slate-200"
                             }`}
                           >
                             {filter === "weekly" && t.filterWeekly}
                             {filter === "monthly" && t.filterMonthly}
                             {filter === "yearly" && t.filterYearly}
+                            {filter === "all" && (lang === "bn" ? "সর্বমোট (All Time)" : "All Time")}
                             {filter === "custom" && t.filterCustom}
                           </button>
                         ))}
                       </div>
-                    </div>
 
-                    {reportsFilter === "custom" && (
-                      <div className="flex flex-col sm:flex-row gap-2 border-t border-gray-200/60 pt-3 animate-fadeIn">
-                        <div className="flex-1 flex items-center gap-2 text-xs">
-                          <span className="font-semibold text-slate-500">Start Date:</span>
+                      {reportsFilter === "custom" && (
+                        <div className="flex items-center gap-1 text-[10px]">
                           <input
                             type="date"
                             value={repStartDate}
                             onChange={(e) => setRepStartDate(e.target.value)}
-                            className="flex-1 h-9 px-2 rounded-lg border border-gray-200 bg-white font-bold"
+                            className="px-2 py-1.5 rounded-lg border border-slate-200 bg-white font-bold max-w-[110px]"
                           />
-                        </div>
-                        <div className="flex-1 flex items-center gap-2 text-xs">
-                          <span className="font-semibold text-slate-500">End Date:</span>
+                          <span className="text-slate-400 font-bold">-</span>
                           <input
                             type="date"
                             value={repEndDate}
                             onChange={(e) => setRepEndDate(e.target.value)}
-                            className="flex-1 h-9 px-2 rounded-lg border border-gray-200 bg-white font-bold"
+                            className="px-2 py-1.5 rounded-lg border border-slate-200 bg-white font-bold max-w-[110px]"
                           />
                         </div>
-                      </div>
-                    )}
+                      )}
+
+                      <button
+                        onClick={handleDownloadPdfReport}
+                        disabled={downloadingPdf}
+                        className="px-4 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs transition-all active:scale-[0.99] disabled:opacity-50 flex items-center justify-center gap-1.5 cursor-pointer shadow-md shrink-0"
+                      >
+                        {downloadingPdf ? (
+                          <>
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            <span>{t.downloadingPdfBtn}</span>
+                          </>
+                        ) : (
+                          <>
+                            <FileText className="w-4 h-4 text-emerald-300" />
+                            <span>{t.downloadPdfBtn}</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
                   </div>
 
                   {/* Financial Overview Positions */}
@@ -2216,6 +2567,80 @@ export default function AdminPage() {
                     </div>
 
                   </div>
+
+                  {/* Category-wise Tabular Breakdown Lists */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pt-4 animate-fadeIn">
+                    {/* Collections Category List */}
+                    <div className="p-4 bg-white rounded-3xl border border-slate-150 shadow-sm space-y-3">
+                      <h4 className="text-xs font-black text-slate-700 uppercase tracking-wide border-b border-slate-100 pb-2 flex items-center justify-between">
+                        <span>{lang === "bn" ? "আদায়ের খাতওয়ারী তালিকা" : "Collections Category Breakdown"}</span>
+                        <span className="text-[10px] text-emerald-700 font-bold bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-100/50">
+                          {lang === "bn" ? "মোট আয়" : "Total Income"}
+                        </span>
+                      </h4>
+                      <div className="overflow-hidden rounded-2xl border border-slate-100">
+                        <table className="w-full text-left text-xs">
+                          <thead>
+                            <tr className="bg-slate-50 text-slate-400 font-bold border-b border-slate-100">
+                              <th className="py-2.5 px-3 font-semibold">{lang === "bn" ? "খাত" : "Category"}</th>
+                              <th className="py-2.5 px-3 font-semibold text-right">{lang === "bn" ? "পরিমাণ" : "Amount"}</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-50">
+                            {[
+                              { key: "jumma_collection", label: lang === "bn" ? "জুমা আদায়" : "Jumma Collection" },
+                              { key: "general_fund", label: lang === "bn" ? "সাধারণ দান (লিল্লাহ)" : "General Donation" },
+                              { key: "mosque_development", label: lang === "bn" ? "মসজিদ উন্নয়ন" : "Mosque Development" }
+                            ].map((cat) => {
+                              const amount = stats.incomeByCategory[cat.key] || 0;
+                              return (
+                                <tr key={cat.key} className="hover:bg-slate-50/50 transition-colors">
+                                  <td className="py-2 px-3 font-extrabold text-slate-800">{cat.label}</td>
+                                  <td className="py-2 px-3 font-black text-slate-900 text-right">{formatCurrency(amount, lang)}</td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+
+                    {/* Expenses Category List */}
+                    <div className="p-4 bg-white rounded-3xl border border-slate-150 shadow-sm space-y-3">
+                      <h4 className="text-xs font-black text-slate-700 uppercase tracking-wide border-b border-slate-100 pb-2 flex items-center justify-between">
+                        <span>{lang === "bn" ? "খরচের খাতওয়ারী তালিকা" : "Expenses Category Breakdown"}</span>
+                        <span className="text-[10px] text-red-700 font-bold bg-red-50 px-2 py-0.5 rounded-full border border-red-100/50">
+                          {lang === "bn" ? "মোট ব্যয়" : "Total Expenses"}
+                        </span>
+                      </h4>
+                      <div className="overflow-hidden rounded-2xl border border-slate-100">
+                        <table className="w-full text-left text-xs">
+                          <thead>
+                            <tr className="bg-slate-50 text-slate-400 font-bold border-b border-slate-100">
+                              <th className="py-2.5 px-3 font-semibold">{lang === "bn" ? "খাত" : "Category"}</th>
+                              <th className="py-2.5 px-3 font-semibold text-right">{lang === "bn" ? "পরিমাণ" : "Amount"}</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-50">
+                            {[
+                              { key: "salary", label: lang === "bn" ? "ভাতা / সম্মানী" : "Allowance / Salary" },
+                              { key: "utilities", label: lang === "bn" ? "বিদ্যুৎ / ইউটিলিটি বিল" : "Utilities" },
+                              { key: "maintenance", label: lang === "bn" ? "মেরামত ও রক্ষণাবেক্ষণ" : "Repairs & Maintenance" },
+                              { key: "miscellaneous", label: lang === "bn" ? "অন্যান্য খরচ" : "Miscellaneous" }
+                            ].map((cat) => {
+                              const amount = stats.expenseByCategory[cat.key] || 0;
+                              return (
+                                <tr key={cat.key} className="hover:bg-slate-50/50 transition-colors">
+                                  <td className="py-2 px-3 font-extrabold text-slate-800">{cat.label}</td>
+                                  <td className="py-2 px-3 font-black text-red-600 text-right">{formatCurrency(amount, lang)}</td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </div>
                 </div>
               )}
 
@@ -2233,7 +2658,7 @@ export default function AdminPage() {
                   </div>
 
                   {/* Audit Logs Filter Dashboard */}
-                  <div className="p-4 bg-gray-50 border border-gray-150 rounded-2xl grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+                  <div className="p-4 bg-gray-50 border border-gray-150 rounded-2xl grid grid-cols-1 sm:grid-cols-4 gap-3 text-xs">
                     
                     {/* Admin Dropdown Filter */}
                     <div className="space-y-1">
@@ -2247,6 +2672,23 @@ export default function AdminPage() {
                         {allAdmins.map(adm => (
                           <option key={adm.id} value={adm.email}>{adm.email}</option>
                         ))}
+                      </select>
+                    </div>
+
+                    {/* Action Type Dropdown Filter */}
+                    <div className="space-y-1">
+                      <span className="font-extrabold text-slate-600 block">{lang === "bn" ? "অ্যাকশন টাইপ ফিল্টার:" : "Action Type:"}</span>
+                      <select
+                        value={logFilterAction}
+                        onChange={(e) => setLogFilterAction(e.target.value)}
+                        className="w-full h-9 px-2 rounded-lg border border-gray-200 bg-white font-bold text-slate-700 cursor-pointer"
+                      >
+                        <option value="all">{lang === "bn" ? "সকল অ্যাকশন" : "All Actions"}</option>
+                        <option value="create">{lang === "bn" ? "যোগ করা (Create)" : "Create"}</option>
+                        <option value="update">{lang === "bn" ? "পরিবর্তন করা (Update)" : "Update"}</option>
+                        <option value="delete">{lang === "bn" ? "অপসারণ করা (Delete)" : "Delete"}</option>
+                        <option value="approve">{lang === "bn" ? "অনুমোদন (Approve)" : "Approve"}</option>
+                        <option value="reject">{lang === "bn" ? "প্রত্যাখ্যান (Reject)" : "Reject"}</option>
                       </select>
                     </div>
 
@@ -2280,32 +2722,49 @@ export default function AdminPage() {
                       <p>{t.logNoData}</p>
                     </div>
                   ) : (
-                    <div className="space-y-3">
+                    <div className="relative pl-6 border-l-2 border-emerald-100 space-y-6 ml-3 py-2">
                       {filteredAuditLogs.map((log) => (
-                        <div
-                          key={log.id}
-                          className="p-4 rounded-2xl bg-white border border-gray-150 shadow-sm hover:border-emerald-100 transition-all flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs"
-                        >
-                          <div className="space-y-1.5 flex-1">
-                            <div className="flex items-center flex-wrap gap-2">
-                              <span className="font-black text-slate-900 block truncate">{log.adminEmail}</span>
-                              <span className={`text-[8.5px] px-2 py-0.5 rounded-full font-black uppercase ${
-                                log.actionType === "approve" ? "bg-emerald-50 text-emerald-700 border border-emerald-100" :
-                                log.actionType === "create" ? "bg-sky-50 text-sky-700 border border-sky-100" :
-                                log.actionType === "update" ? "bg-purple-50 text-purple-700 border border-purple-100" :
-                                log.actionType === "reject" ? "bg-amber-50 text-amber-700 border border-amber-100" :
-                                "bg-red-50 text-red-700 border border-red-100"
-                              }`}>
-                                {log.actionType}
-                              </span>
-                              <span className="text-slate-400 font-semibold uppercase text-[9px]">{log.collectionName}</span>
-                            </div>
-                            <p className="text-slate-600 font-semibold leading-relaxed">{log.details}</p>
+                        <div key={log.id} className="relative group animate-fadeIn">
+                          {/* Timeline node icon */}
+                          <div className={`absolute -left-[31px] top-1.5 w-4 h-4 rounded-full border-2 bg-white flex items-center justify-center transition-all ${
+                            log.actionType === "approve" ? "border-emerald-650 ring-4 ring-emerald-50" :
+                            log.actionType === "create" ? "border-sky-650 ring-4 ring-sky-50" :
+                            log.actionType === "update" ? "border-purple-650 ring-4 ring-purple-50" :
+                            log.actionType === "reject" ? "border-amber-650 ring-4 ring-amber-50" :
+                            "border-red-650 ring-4 ring-red-50"
+                          }`}>
+                            <div className={`w-1.5 h-1.5 rounded-full ${
+                              log.actionType === "approve" ? "bg-emerald-600" :
+                              log.actionType === "create" ? "bg-sky-600" :
+                              log.actionType === "update" ? "bg-purple-600" :
+                              log.actionType === "reject" ? "bg-amber-650" :
+                              "bg-red-600"
+                            }`}></div>
                           </div>
 
-                          <div className="text-slate-400 font-bold uppercase tracking-wider text-[9px] shrink-0 whitespace-nowrap self-start sm:self-center flex items-center gap-1">
-                            <Calendar className="w-3.5 h-3.5" />
-                            <span>{log.timestamp.toLocaleString()}</span>
+                          {/* Log content bubble */}
+                          <div className="p-4 rounded-2xl bg-white border border-slate-150 shadow-sm hover:shadow-md hover:border-emerald-150 transition-all flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+                            <div className="space-y-1.5 flex-1">
+                              <div className="flex items-center flex-wrap gap-2">
+                                <span className="font-black text-slate-900 block truncate">{log.adminEmail}</span>
+                                <span className={`text-[8.5px] px-2 py-0.5 rounded-full font-black uppercase ${
+                                  log.actionType === "approve" ? "bg-emerald-50 text-emerald-700 border border-emerald-100" :
+                                  log.actionType === "create" ? "bg-sky-50 text-sky-700 border border-sky-100" :
+                                  log.actionType === "update" ? "bg-purple-50 text-purple-700 border border-purple-100" :
+                                  log.actionType === "reject" ? "bg-amber-50 text-amber-700 border border-amber-100" :
+                                  "bg-red-50 text-red-700 border border-red-100"
+                                }`}>
+                                  {log.actionType}
+                                </span>
+                                <span className="text-slate-400 font-semibold uppercase text-[9px]">{log.collectionName}</span>
+                              </div>
+                              <p className="text-slate-600 font-semibold leading-relaxed">{log.details}</p>
+                            </div>
+
+                            <div className="text-slate-400 font-bold uppercase tracking-wider text-[9px] shrink-0 whitespace-nowrap self-start sm:self-center flex items-center gap-1">
+                              <Calendar className="w-3.5 h-3.5 text-slate-400" />
+                              <span>{log.timestamp.toLocaleString()}</span>
+                            </div>
                           </div>
                         </div>
                       ))}
@@ -2394,6 +2853,125 @@ export default function AdminPage() {
                       </div>
                     )}
                   </div>
+                </div>
+              )}
+
+              {/* ========================================================
+                  TAB 9: SUPER ADMIN SYSTEM SETTINGS & DIGITAL SIGNATURES
+                  ======================================================== */}
+              {activeTab === "settings" && adminProfile?.role === "superadmin" && (
+                <div className="space-y-6">
+                  <div className="border-b border-gray-150 pb-4 mb-4">
+                    <h2 className="text-base sm:text-lg font-extrabold text-slate-900">
+                      {lang === "bn" ? "সিস্টেম সেটিংস ও ডিজিটাল স্বাক্ষর" : "System Settings & Digital Signatures"}
+                    </h2>
+                    <p className="text-xs text-slate-500 mt-1 font-semibold">
+                      {lang === "bn"
+                        ? "সুপার অ্যাডমিনদের জন্য। মসজিদ কমিটির সভাপতি ও ক্যাশিয়ারের ডিজিটাল স্বাক্ষর ছবি আপলোড করুন।"
+                        : "For Super Admins. Upload dynamic signature images for the Committee President & Treasurer."}
+                    </p>
+                  </div>
+
+                  <form onSubmit={handleSaveSignatures} className="space-y-6 max-w-xl mx-auto">
+                    {/* President Signature Image */}
+                    <div className="space-y-2.5">
+                      <label className="text-xs font-bold text-slate-700 uppercase tracking-wide">
+                        {lang === "bn" ? "মসজিদ কমিটি সভাপতির স্বাক্ষর (সর্বোচ্চ ৫০০KB)" : "Mosque Committee President Signature (Max 500KB)"}
+                      </label>
+                      
+                      {globalSettings?.presidentSignatureUrl && (
+                        <div className="p-3 border border-emerald-100 rounded-xl bg-emerald-50/20 max-w-[200px] mb-2">
+                          <p className="text-[9px] font-bold text-emerald-800 mb-1 uppercase tracking-wider">Active Signature:</p>
+                          <img src={globalSettings.presidentSignatureUrl} alt="President Active Sig" className="h-10 object-contain" />
+                        </div>
+                      )}
+
+                      <div className="flex items-center justify-center w-full">
+                        <label className="flex flex-col items-center justify-center w-full h-28 border-2 border-gray-300 border-dashed rounded-xl cursor-pointer bg-gray-50 hover:bg-gray-100 transition-colors relative overflow-hidden">
+                          <div className="flex flex-col items-center justify-center pt-4 pb-4">
+                            <UploadCloud className="w-7 h-7 mb-2 text-slate-400" />
+                            <p className="mb-1 text-xs text-slate-500 font-semibold">
+                              {presSigFile ? presSigFile.name : (lang === "bn" ? "সভাপতির স্বাক্ষর ফাইল নির্বাচন করুন" : "Click to select President's signature")}
+                            </p>
+                            <p className="text-[9px] text-slate-400">PNG, JPG or JPEG only (&lt; 500KB)</p>
+                          </div>
+                          <input
+                            type="file"
+                            accept="image/*"
+                            ref={presSigInputRef}
+                            onChange={(e) => {
+                              if (e.target.files && e.target.files[0]) {
+                                const file = e.target.files[0];
+                                if (file.size > 500 * 1024) {
+                                  triggerToast("error", t.saveError, lang === "bn" ? "ফাইলের সাইজ ৫০০KB এর কম হতে হবে!" : "File size must be less than 500KB!");
+                                } else {
+                                  setPresSigFile(file);
+                                }
+                              }
+                            }}
+                            className="hidden"
+                          />
+                        </label>
+                      </div>
+                    </div>
+
+                    {/* Treasurer Signature Image */}
+                    <div className="space-y-2.5">
+                      <label className="text-xs font-bold text-slate-700 uppercase tracking-wide">
+                        {lang === "bn" ? "মসজিদ কোষাধ্যক্ষ / ক্যাশিয়ারের স্বাক্ষর (সর্বোচ্চ ৫০০KB)" : "Mosque Treasurer / Cashier Signature (Max 500KB)"}
+                      </label>
+                      
+                      {globalSettings?.treasurerSignatureUrl && (
+                        <div className="p-3 border border-emerald-100 rounded-xl bg-emerald-50/20 max-w-[200px] mb-2">
+                          <p className="text-[9px] font-bold text-emerald-800 mb-1 uppercase tracking-wider">Active Signature:</p>
+                          <img src={globalSettings.treasurerSignatureUrl} alt="Treasurer Active Sig" className="h-10 object-contain" />
+                        </div>
+                      )}
+
+                      <div className="flex items-center justify-center w-full">
+                        <label className="flex flex-col items-center justify-center w-full h-28 border-2 border-gray-300 border-dashed rounded-xl cursor-pointer bg-gray-50 hover:bg-gray-100 transition-colors relative overflow-hidden">
+                          <div className="flex flex-col items-center justify-center pt-4 pb-4">
+                            <UploadCloud className="w-7 h-7 mb-2 text-slate-400" />
+                            <p className="mb-1 text-xs text-slate-500 font-semibold">
+                              {treasSigFile ? treasSigFile.name : (lang === "bn" ? "ক্যাশিয়ারের স্বাক্ষর ফাইল নির্বাচন করুন" : "Click to select Treasurer's signature")}
+                            </p>
+                            <p className="text-[9px] text-slate-400">PNG, JPG or JPEG only (&lt; 500KB)</p>
+                          </div>
+                          <input
+                            type="file"
+                            accept="image/*"
+                            ref={treasSigInputRef}
+                            onChange={(e) => {
+                              if (e.target.files && e.target.files[0]) {
+                                const file = e.target.files[0];
+                                if (file.size > 500 * 1024) {
+                                  triggerToast("error", t.saveError, lang === "bn" ? "ফাইলের সাইজ ৫০০KB এর কম হতে হবে!" : "File size must be less than 500KB!");
+                                } else {
+                                  setTreasSigFile(file);
+                                }
+                              }
+                            }}
+                            className="hidden"
+                          />
+                        </label>
+                      </div>
+                    </div>
+
+                    <button
+                      type="submit"
+                      disabled={savingSettings}
+                      className="w-full h-11 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-350 disabled:cursor-not-allowed text-white font-bold text-sm shadow-sm transition-all active:scale-[0.98] flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      {savingSettings ? (
+                        <>
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                          <span>{lang === "bn" ? "স্বাক্ষর সংরক্ষণ হচ্ছে..." : "Saving Signatures..."}</span>
+                        </>
+                      ) : (
+                        <span>{lang === "bn" ? "স্বাক্ষর ফাইল সংরক্ষণ করুন" : "Save Signature Configurations"}</span>
+                      )}
+                    </button>
+                  </form>
                 </div>
               )}
 
@@ -2671,6 +3249,326 @@ export default function AdminPage() {
           </div>
         </div>
       )}
+
+        {/* Hidden A4 HTML template for high-fidelity PDF Financial Statement generation */}
+        <div style={{ position: "absolute", left: "-9999px", top: "-9999px" }}>
+          <div
+            id="statement-pdf-template"
+            className="w-[794px] p-8 flex flex-col font-sans"
+            style={{ minHeight: "1123px", backgroundColor: "#ffffff", color: "#1e293b", border: "1px solid #e5e7eb" }}
+          >
+            {/* Header */}
+            <div className="p-6 rounded-t-xl text-center relative" style={{ backgroundColor: "#065f46", color: "#ffffff" }}>
+              <div style={{ position: "absolute", top: "16px", right: "16px", fontSize: "9px", color: "rgba(255, 255, 255, 0.8)", fontWeight: "bold" }}>
+                Download Date: {new Date().toLocaleDateString("en-US", { day: "numeric", month: "long", year: "numeric" })}
+              </div>
+              <h1 className="text-2xl font-bold tracking-wide uppercase">Subedar Jame Masjid Al Khawari</h1>
+              <p className="text-xs mt-1 uppercase font-semibold" style={{ color: "#d1fae5" }}>Subedar Jame Masjid Al Khawari Management Committee</p>
+              <p className="text-xs mt-0.5 font-medium" style={{ color: "#a7f3d0" }}>South Mirer Khil, Hathazari, Chattogram, Bangladesh</p>
+              <h2 className="text-base font-extrabold tracking-widest mt-4 uppercase pt-3" style={{ color: "#d1fae5", borderTop: "1px solid rgba(4, 120, 87, 0.6)" }}>
+                OFFICIAL FINANCIAL STATEMENT REPORT
+              </h2>
+            </div>
+
+            {/* Statement Body */}
+            <div className="flex-grow p-6 flex flex-col space-y-6">
+              {/* Date Metadata */}
+              <div className="flex justify-between items-center text-xs font-semibold p-4 rounded-xl" style={{ color: "#64748b", backgroundColor: "#f8fafc" }}>
+                <span>REPORT PERIOD: <strong style={{ color: "#1e293b" }}>{repStartDate ? repStartDate : "Inception"} - {repEndDate ? repEndDate : new Date().toLocaleDateString("en-US")}</strong></span>
+                <span>Download Date: {new Date().toLocaleDateString("en-US", { day: "numeric", month: "long", year: "numeric" })}</span>
+              </div>
+
+              {/* Financial Position Cards */}
+              <div className="grid grid-cols-3 gap-4">
+                <div className="p-4 rounded-2xl text-center space-y-1" style={{ border: "1px solid #ccfbf1", backgroundColor: "rgba(240, 253, 250, 0.3)" }}>
+                  <span className="text-[10px] font-bold uppercase tracking-wider block" style={{ color: "#115e59" }}>Total Collections</span>
+                  <span className="text-base font-black block" style={{ color: "#0d9488" }}>৳{stats.totalIncome.toLocaleString()}.00</span>
+                </div>
+                <div className="p-4 rounded-2xl text-center space-y-1" style={{ border: "1px solid #fee2e2", backgroundColor: "rgba(254, 242, 242, 0.2)" }}>
+                  <span className="text-[10px] font-bold uppercase tracking-wider block" style={{ color: "#991b1b" }}>Total Expenditures</span>
+                  <span className="text-base font-black block" style={{ color: "#dc2626" }}>৳{stats.totalExpenses.toLocaleString()}.00</span>
+                </div>
+                <div className="p-4 rounded-2xl text-center space-y-1 shadow-sm" style={{ backgroundColor: "#065f46", color: "#ffffff" }}>
+                  <span className="text-[10px] font-bold uppercase tracking-wider block" style={{ color: "#d1fae5" }}>Net Available Fund</span>
+                  <span className="text-base font-black block">৳{stats.netBalance.toLocaleString()}.00</span>
+                </div>
+              </div>
+
+              {/* Breakdown Grid */}
+              <div className="grid grid-cols-2 gap-6 pt-2">
+                {/* Income Breakdown */}
+                <div className="space-y-3">
+                  <h3 className="text-xs font-extrabold uppercase tracking-wider pb-1.5 flex items-center gap-1" style={{ color: "#1e293b", borderBottom: "1px solid #f1f5f9" }}>
+                    <span className="w-2 h-2 rounded-full inline-block" style={{ backgroundColor: "#14b8a6" }}></span>
+                    <span>Collections Category Breakdown</span>
+                  </h3>
+                  <table className="w-full text-left text-xs">
+                    <thead>
+                      <tr style={{ borderBottom: "1px solid #f1f5f9", color: "#94a3b8" }}>
+                        <th className="py-2 font-bold uppercase">Category Name</th>
+                        <th className="py-2 text-right font-bold uppercase">BDT Amount</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {Object.entries(stats.incomeByCategory).map(([cat, amt]) => (
+                        <tr key={cat} style={{ borderBottom: "1px solid rgba(241, 245, 249, 0.5)" }}>
+                          <td className="py-2.5 font-medium" style={{ color: "#475569" }}>{translateCategory(cat, "en")}</td>
+                          <td className="py-2.5 text-right font-bold" style={{ color: "#1e293b" }}>৳{amt.toLocaleString()}</td>
+                        </tr>
+                      ))}
+                      {Object.keys(stats.incomeByCategory).length === 0 && (
+                        <tr>
+                          <td colSpan={2} className="py-4 text-center font-bold" style={{ color: "#94a3b8" }}>No collections in this range.</td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+
+                {/* Expense Breakdown */}
+                <div className="space-y-3">
+                  <h3 className="text-xs font-extrabold uppercase tracking-wider pb-1.5 flex items-center gap-1" style={{ color: "#1e293b", borderBottom: "1px solid #f1f5f9" }}>
+                    <span className="w-2 h-2 rounded-full inline-block" style={{ backgroundColor: "#ef4444" }}></span>
+                    <span>Expenditures Category Breakdown</span>
+                  </h3>
+                  <table className="w-full text-left text-xs">
+                    <thead>
+                      <tr style={{ borderBottom: "1px solid #f1f5f9", color: "#94a3b8" }}>
+                        <th className="py-2 font-bold uppercase">Expense Category</th>
+                        <th className="py-2 text-right font-bold uppercase">BDT Amount</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {Object.entries(stats.expenseByCategory).map(([cat, amt]) => (
+                        <tr key={cat} style={{ borderBottom: "1px solid rgba(241, 245, 249, 0.5)" }}>
+                          <td className="py-2.5 font-medium" style={{ color: "#475569" }}>{translateCategory(cat, "en")}</td>
+                          <td className="py-2.5 text-right font-bold" style={{ color: "#1e293b" }}>৳{amt.toLocaleString()}</td>
+                        </tr>
+                      ))}
+                      {Object.keys(stats.expenseByCategory).length === 0 && (
+                        <tr>
+                          <td colSpan={2} className="py-4 text-center font-bold" style={{ color: "#94a3b8" }}>No expenditures in this range.</td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              {/* Approved Ledger List Table (Limit to 10 for layout spacing) */}
+              <div className="space-y-3 pt-2">
+                <h3 className="text-xs font-extrabold uppercase tracking-wider pb-1.5" style={{ color: "#1e293b", borderBottom: "1px solid #f1f5f9" }}>
+                  Recent Approved Ledger Transactions
+                </h3>
+                <table className="w-full text-left text-[11px] rounded-xl overflow-hidden shadow-sm" style={{ border: "1px solid #f1f5f9" }}>
+                  <thead>
+                    <tr style={{ backgroundColor: "#f8fafc", borderBottom: "1px solid #f1f5f9", color: "#64748b" }} className="uppercase font-bold">
+                      <th className="p-2.5">Date</th>
+                      <th className="p-2.5">Donor/Description</th>
+                      <th className="p-2.5">Category</th>
+                      <th className="p-2.5">Type</th>
+                      <th className="p-2.5 text-right">BDT Amount</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredApprovedDonationsForReport.slice(0, 10).map((d) => (
+                      <tr key={d.id} style={{ borderBottom: "1px solid #f8fafc" }} className="font-medium">
+                        <td className="p-2.5" style={{ color: "#94a3b8" }}>{d.date.toLocaleDateString()}</td>
+                        <td className="p-2.5" style={{ color: "#334155" }}>{d.isAnonymous ? "Anonymous" : d.donorName || "Anonymous"}</td>
+                        <td className="p-2.5" style={{ color: "#64748b" }}>{translateCategory(d.category, "en")}</td>
+                        <td className="p-2.5 uppercase font-bold" style={{ color: "#0d9488" }}>INCOME</td>
+                        <td className="p-2.5 text-right font-bold" style={{ color: "#1e293b" }}>৳{d.amount.toLocaleString()}</td>
+                      </tr>
+                    ))}
+                    {filteredExpensesForReport.slice(0, 10).map((e) => (
+                      <tr key={e.id} style={{ borderBottom: "1px solid #f8fafc" }} className="font-medium">
+                        <td className="p-2.5" style={{ color: "#94a3b8" }}>{e.date.toLocaleDateString()}</td>
+                        <td className="p-2.5" style={{ color: "#334155" }}>{e.description}</td>
+                        <td className="p-2.5" style={{ color: "#64748b" }}>{translateCategory(e.category, "en")}</td>
+                        <td className="p-2.5 uppercase font-bold" style={{ color: "#dc2626" }}>EXPENSE</td>
+                        <td className="p-2.5 text-right font-bold" style={{ color: "#1e293b" }}>৳{e.amount.toLocaleString()}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Digital Signatures from Settings */}
+              <div className="pt-10 grid grid-cols-2 gap-8 text-center text-xs font-semibold mt-auto" style={{ color: "#94a3b8" }}>
+                <div className="flex flex-col items-center justify-end space-y-1">
+                  {globalSettings?.treasurerSignatureUrl ? (
+                    <img
+                      src={globalSettings.treasurerSignatureUrl}
+                      alt="Treasurer Signature"
+                      className="h-10 object-contain mb-1 select-none pointer-events-none"
+                      crossOrigin="anonymous"
+                    />
+                  ) : (
+                    <div className="h-10 w-3/4 mb-1" style={{ borderBottom: "1px dashed #e2e8f0" }} />
+                  )}
+                  <div className="w-full pt-1.5" style={{ borderTop: "1px solid #f1f5f9" }}>
+                    <span className="block font-bold" style={{ color: "#334155" }}>Masjid Treasurer Signature</span>
+                    <span className="block text-[9px] font-medium" style={{ color: "#94a3b8" }}>Subedar Jame Masjid Al Khawari</span>
+                  </div>
+                </div>
+
+                <div className="flex flex-col items-center justify-end space-y-1">
+                  {globalSettings?.presidentSignatureUrl ? (
+                    <img
+                      src={globalSettings.presidentSignatureUrl}
+                      alt="President Signature"
+                      className="h-10 object-contain mb-1 select-none pointer-events-none"
+                      crossOrigin="anonymous"
+                    />
+                  ) : (
+                    <div className="h-10 w-3/4 mb-1" style={{ borderBottom: "1px dashed #e2e8f0" }} />
+                  )}
+                  <div className="w-full pt-1.5" style={{ borderTop: "1px solid #f1f5f9" }}>
+                    <span className="block font-bold" style={{ color: "#334155" }}>Mosque Committee President</span>
+                    <span className="block text-[9px] font-medium" style={{ color: "#94a3b8" }}>Subedar Jame Masjid Al Khawari</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Footer banner */}
+            <div className="p-4 rounded-b-xl text-center text-[10px] leading-normal" style={{ backgroundColor: "#f8fafc", borderTop: "1px solid #f1f5f9", color: "#94a3b8" }}>
+              <p className="font-semibold" style={{ color: "#64748b" }}>Thank you for your transparent cooperation. May Allah accept your contribution. JazakAllahu Khairan.</p>
+              <p className="text-[8px] mt-0.5" style={{ color: "#cbd5e1" }}>This financial statement is digitally verified and prepared directly under Subedar Jame Masjid Al Khawari Audit system.</p>
+            </div>
+          </div>
+        </div>
+
+        {/* Hidden A5 HTML template for high-fidelity PDF Cash Receipt generation */}
+        <div style={{ position: "absolute", left: "-9999px", top: "-9999px" }}>
+          <div
+            id="receipt-pdf-template"
+            className="w-[595px] p-8 flex flex-col font-sans"
+            style={{ minHeight: "842px", backgroundColor: "#ffffff", color: "#1e293b", border: "1px solid #e5e7eb" }}
+          >
+            {/* Header */}
+            <div className="p-5 rounded-t-xl text-center relative" style={{ backgroundColor: "#065f46", color: "#ffffff" }}>
+              <div style={{ position: "absolute", top: "12px", right: "16px", fontSize: "8px", color: "rgba(255, 255, 255, 0.8)", fontWeight: "bold" }}>
+                Download Date: {new Date().toLocaleDateString("en-US", { day: "numeric", month: "long", year: "numeric" })}
+              </div>
+              <h1 className="text-xl font-bold tracking-wide uppercase">Subedar Jame Masjid Al Khawari</h1>
+              <p className="text-[10px] mt-1 uppercase font-semibold" style={{ color: "#d1fae5" }}>Subedar Jame Masjid Al Khawari Management Committee</p>
+              <p className="text-[10px] mt-0.5 font-medium" style={{ color: "#a7f3d0" }}>South Mirer Khil, Hathazari, Chattogram, Bangladesh</p>
+            </div>
+
+            {/* Receipt Body */}
+            <div className="flex-grow p-6 flex flex-col space-y-6">
+              <div className="text-center mt-2">
+                <h2 className="text-base font-extrabold tracking-wider uppercase pb-2 inline-block px-4" style={{ color: "#1e293b", borderBottom: "2px solid #f1f5f9" }}>
+                  CASH RECEIPT
+                </h2>
+              </div>
+
+              {/* Date and ID */}
+              <div className="flex justify-between items-center text-xs font-semibold p-3 rounded-lg" style={{ color: "#64748b", backgroundColor: "#f8fafc" }}>
+                <span>RECEIPT ID: <strong style={{ color: "#1e293b" }}>{pdfReceiptData ? pdfReceiptData.receiptId : ""}</strong></span>
+                <span>Download Date: {new Date().toLocaleDateString("en-US", { day: "numeric", month: "long", year: "numeric" })}</span>
+              </div>
+
+              {/* Receipt Details Grid */}
+              <div className="rounded-xl overflow-hidden shadow-sm" style={{ border: "1px solid #f1f5f9" }}>
+                <table className="w-full text-xs text-left">
+                  <tbody>
+                    <tr style={{ borderBottom: "1px solid #f8fafc", backgroundColor: "rgba(248, 250, 252, 0.2)" }}>
+                      <td className="p-3.5 font-bold uppercase w-1/3" style={{ color: "#94a3b8" }}>Donor Name:</td>
+                      <td className="p-3.5 font-medium" style={{ color: "#1e293b" }}>
+                        {pdfReceiptData ? (pdfReceiptData.isAnonymous ? "Anonymous Donor (Nam Prokash e Onicchuk)" : pdfReceiptData.donorName || "Anonymous") : ""}
+                      </td>
+                    </tr>
+                    <tr style={{ borderBottom: "1px solid #f8fafc" }}>
+                      <td className="p-3.5 font-bold uppercase" style={{ color: "#94a3b8" }}>Donation Category:</td>
+                      <td className="p-3.5 font-medium" style={{ color: "#1e293b" }}>
+                        {pdfReceiptData ? translateCategory(pdfReceiptData.category, "en") : ""}
+                      </td>
+                    </tr>
+                    <tr style={{ borderBottom: "1px solid #f8fafc", backgroundColor: "rgba(248, 250, 252, 0.2)" }}>
+                      <td className="p-3.5 font-bold uppercase" style={{ color: "#94a3b8" }}>Payment Method:</td>
+                      <td className="p-3.5 font-medium uppercase" style={{ color: "#1e293b" }}>
+                        {pdfReceiptData ? pdfReceiptData.paymentMethod.toUpperCase() : ""}
+                      </td>
+                    </tr>
+                    <tr style={{ borderBottom: "1px solid #f8fafc" }}>
+                      <td className="p-3.5 font-bold uppercase" style={{ color: "#94a3b8" }}>Transaction ID:</td>
+                      <td className="p-3.5 font-medium break-all font-mono" style={{ color: "#1e293b" }}>
+                        {pdfReceiptData ? (pdfReceiptData.trxId || "N/A (Cash Entry)") : ""}
+                      </td>
+                    </tr>
+                    <tr style={{ backgroundColor: "rgba(248, 250, 252, 0.2)" }}>
+                      <td className="p-3.5 font-bold uppercase" style={{ color: "#94a3b8" }}>Approval Date:</td>
+                      <td className="p-3.5 font-medium" style={{ color: "#1e293b" }}>
+                        {pdfReceiptData ? pdfReceiptData.date.toLocaleDateString("en-US", { day: "numeric", month: "long", year: "numeric" }) : ""}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Amount Display */}
+              <div className="rounded-xl p-4 flex justify-between items-center" style={{ backgroundColor: "rgba(240, 253, 250, 0.6)", border: "1px solid #ccfbf1" }}>
+                <span className="text-xs font-bold uppercase" style={{ color: "#115e59" }}>Total Amount Received:</span>
+                <span className="text-base font-extrabold" style={{ color: "#0d9488" }}>
+                  ৳{pdfReceiptData ? pdfReceiptData.amount.toLocaleString() : "0"}.00
+                </span>
+              </div>
+
+              {/* Verification Seal */}
+              <div className="flex justify-center mt-2">
+                <div className="px-5 py-1.5 rounded-full text-[10px] font-extrabold tracking-widest uppercase flex items-center gap-1.5 shadow-sm" style={{ backgroundColor: "#ecfdf5", border: "1px solid #a7f3d0", color: "#047857" }}>
+                  <CheckCircle2 className="w-3.5 h-3.5" style={{ color: "#059669" }} />
+                  <span>Verified & Cash Received</span>
+                </div>
+              </div>
+
+              {/* Digital Signatures from Settings */}
+              <div className="pt-8 grid grid-cols-2 gap-8 text-center text-[10px] font-semibold mt-auto" style={{ color: "#94a3b8" }}>
+                <div className="flex flex-col items-center justify-end space-y-1">
+                  {globalSettings?.treasurerSignatureUrl ? (
+                    <img
+                      src={globalSettings.treasurerSignatureUrl}
+                      alt="Treasurer Signature"
+                      className="h-10 object-contain mb-1 select-none pointer-events-none"
+                      crossOrigin="anonymous"
+                    />
+                  ) : (
+                    <div className="h-10 w-3/4 mb-1" style={{ borderBottom: "1px dashed #e2e8f0" }} />
+                  )}
+                  <div className="w-full pt-1.5" style={{ borderTop: "1px solid #f1f5f9" }}>
+                    <span className="block font-bold" style={{ color: "#334155" }}>Masjid Treasurer</span>
+                    <span className="block text-[8px] font-medium" style={{ color: "#94a3b8" }}>Subedar Jame Masjid Al Khawari</span>
+                  </div>
+                </div>
+
+                <div className="flex flex-col items-center justify-end space-y-1">
+                  {globalSettings?.presidentSignatureUrl ? (
+                    <img
+                      src={globalSettings.presidentSignatureUrl}
+                      alt="President Signature"
+                      className="h-10 object-contain mb-1 select-none pointer-events-none"
+                      crossOrigin="anonymous"
+                    />
+                  ) : (
+                    <div className="h-10 w-3/4 mb-1" style={{ borderBottom: "1px dashed #e2e8f0" }} />
+                  )}
+                  <div className="w-full pt-1.5" style={{ borderTop: "1px solid #f1f5f9" }}>
+                    <span className="block font-bold" style={{ color: "#334155" }}>Mosque Committee President</span>
+                    <span className="block text-[8px] font-medium" style={{ color: "#94a3b8" }}>Subedar Jame Masjid Al Khawari</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Footer banner */}
+            <div className="p-4 rounded-b-xl text-center text-[8px] leading-normal" style={{ backgroundColor: "#f8fafc", borderTop: "1px solid #f1f5f9", color: "#94a3b8" }}>
+              <p className="font-semibold" style={{ color: "#64748b" }}>Thank you for your generous contribution. May Allah accept your donation.</p>
+              <p className="text-[7px] mt-0.5" style={{ color: "#cbd5e1" }}>This is a digitally verified financial receipt generated under Subedar Jame Masjid Al Khawari Al Audit system.</p>
+            </div>
+          </div>
+        </div>
 
     </div>
   );

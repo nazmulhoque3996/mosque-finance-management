@@ -2,6 +2,7 @@ import {
   collection,
   addDoc,
   updateDoc,
+  setDoc,
   doc,
   getDocs,
   getDoc,
@@ -29,6 +30,7 @@ export interface UserProfile {
 
 export interface Donation {
   id?: string;
+  receiptId?: string;
   donorName?: string;
   amount: number;
   date: Date;
@@ -37,6 +39,11 @@ export interface Donation {
   category: string; // Standardized Keys: "jumma_collection", "general_fund", "mosque_development"
   isAnonymous: boolean;
   status: "pending" | "approved" | "rejected";
+}
+
+export interface SystemSettings {
+  presidentSignatureUrl: string | null;
+  treasurerSignatureUrl: string | null;
 }
 
 export interface Expense {
@@ -69,6 +76,18 @@ export interface AuditLog {
 // ==========================================
 
 /**
+ * Generates a unique 6-character uppercase alphanumeric Receipt ID (e.g. REC-A7B8C9)
+ */
+export function generateReceiptId(): string {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  let result = "";
+  for (let i = 0; i < 6; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return `REC-${result}`;
+}
+
+/**
  * Safely converts a Firestore Timestamp (or any date representation) to a standard JS Date.
  * Essential for Next.js SSR serialization to prevent hydration errors.
  */
@@ -87,6 +106,7 @@ function mapDonationDoc(doc: QueryDocumentSnapshot<DocumentData>): Donation {
   const data = doc.data();
   return {
     id: doc.id,
+    receiptId: data.receiptId || `REC-${doc.id.substring(0, 6).toUpperCase()}`,
     donorName: data.donorName,
     amount: Number(data.amount) || 0,
     date: toDate(data.date),
@@ -196,11 +216,24 @@ export async function getAuditLogs(): Promise<AuditLog[]> {
 
 /**
  * Uploads a voucher image directly to Firebase Storage and returns the downloadURL.
+ * Wraps uploadBytes inside a robust 12-second timeout to prevent UI hangs.
  */
 export async function uploadVoucherImage(file: File): Promise<string> {
-  const fileRef = ref(storage, `vouchers/${Date.now()}_${file.name}`);
-  const snapshot = await uploadBytes(fileRef, file);
-  return await getDownloadURL(snapshot.ref);
+  try {
+    const fileRef = ref(storage, `vouchers/${Date.now()}_${file.name}`);
+    
+    const uploadPromise = uploadBytes(fileRef, file);
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("Firebase Storage Upload Timeout (12s limit reached)")), 12000)
+    );
+
+    const snapshot = await Promise.race([uploadPromise, timeoutPromise]);
+    const downloadUrl = await getDownloadURL(snapshot.ref);
+    return downloadUrl;
+  } catch (error) {
+    console.error("Firebase Storage upload failed or timed out:", error);
+    throw error;
+  }
 }
 
 // ==========================================
@@ -208,13 +241,15 @@ export async function uploadVoucherImage(file: File): Promise<string> {
 // ==========================================
 
 export async function addDonation(
-  donation: Omit<Donation, "id" | "status" | "date"> & { date?: Date; status?: "pending" | "approved" | "rejected" },
+  donation: Omit<Donation, "id" | "status" | "date"> & { date?: Date; status?: "pending" | "approved" | "rejected"; receiptId?: string },
   adminEmail?: string
 ): Promise<string> {
   const donationsCollection = collection(db, "donations");
   const status = donation.status || "pending";
+  const receiptId = donation.receiptId || generateReceiptId();
   const docRef = await addDoc(donationsCollection, {
     ...donation,
+    receiptId,
     status,
     date: donation.date || new Date(),
   });
@@ -273,9 +308,10 @@ export async function updateDonation(donationId: string, donation: Partial<Donat
   const snapshot = await getDoc(docRef);
   const oldData = snapshot.data();
 
-  await updateDoc(docRef, {
-    ...donation,
-  });
+  const updateData = { ...donation };
+  delete updateData.id;
+
+  await updateDoc(docRef, updateData);
 
   await addAuditLog({
     adminEmail,
@@ -338,9 +374,10 @@ export async function updateExpense(expenseId: string, expense: Partial<Expense>
   const snapshot = await getDoc(docRef);
   const oldData = snapshot.data();
 
-  await updateDoc(docRef, {
-    ...expense,
-  });
+  const updateData = { ...expense };
+  delete updateData.id;
+
+  await updateDoc(docRef, updateData);
 
   await addAuditLog({
     adminEmail,
@@ -398,9 +435,10 @@ export async function updateNotice(noticeId: string, notice: Partial<Notice>, ad
   const snapshot = await getDoc(docRef);
   const oldData = snapshot.data();
 
-  await updateDoc(docRef, {
-    ...notice,
-  });
+  const updateData = { ...notice };
+  delete updateData.id;
+
+  await updateDoc(docRef, updateData);
 
   await addAuditLog({
     adminEmail,
@@ -500,4 +538,43 @@ export async function getDashboardStats(startDate?: Date, endDate?: Date): Promi
     incomeByCategory,
     expenseByCategory,
   };
+}
+
+// ==========================================
+// 10. Global System Settings Utilities
+// ==========================================
+
+/**
+ * Fetches the global settings document.
+ */
+export async function getSystemSettings(): Promise<SystemSettings> {
+  try {
+    const docRef = doc(db, "settings", "global");
+    const snapshot = await getDoc(docRef);
+    if (snapshot.exists()) {
+      const data = snapshot.data();
+      return {
+        presidentSignatureUrl: data.presidentSignatureUrl || null,
+        treasurerSignatureUrl: data.treasurerSignatureUrl || null,
+      };
+    }
+    return {
+      presidentSignatureUrl: null,
+      treasurerSignatureUrl: null,
+    };
+  } catch (error) {
+    console.error("Error fetching system settings:", error);
+    return {
+      presidentSignatureUrl: null,
+      treasurerSignatureUrl: null,
+    };
+  }
+}
+
+/**
+ * Updates the global settings document. Creates it if it doesn't exist.
+ */
+export async function updateSystemSettings(settings: Partial<SystemSettings>): Promise<void> {
+  const docRef = doc(db, "settings", "global");
+  await setDoc(docRef, settings, { merge: true });
 }
