@@ -5,14 +5,15 @@ import {
   doc,
   getDocs,
   getDoc,
+  deleteDoc,
   query,
   where,
-  orderBy,
   Timestamp,
   DocumentData,
   QueryDocumentSnapshot,
 } from "firebase/firestore";
-import { db } from "./firebase";
+import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
+import { db, storage } from "./firebase";
 
 // ==========================================
 // 1. TypeScript Interfaces & Data Models
@@ -33,26 +34,34 @@ export interface Donation {
   date: Date;
   trxId?: string;
   paymentMethod: "cash" | "bkash" | "nagad" | "bank" | "rocket" | "upay";
-  category: string;
+  category: string; // Standardized Keys: "jumma_collection", "general_fund", "mosque_development"
   isAnonymous: boolean;
-  status: "pending" | "approved";
+  status: "pending" | "approved" | "rejected";
 }
 
 export interface Expense {
   id?: string;
-  category: string;
+  category: string; // Standardized Keys: "salary", "utilities", "maintenance", "miscellaneous"
   amount: number;
   date: Date;
   description: string;
-  voucherUrl?: string;
+  voucherUrl?: string | null;
 }
 
 export interface Notice {
   id?: string;
   title: string;
   content: string;
-  imageUrl?: string;
   date: Date;
+}
+
+export interface AuditLog {
+  id?: string;
+  adminEmail: string;
+  actionType: "approve" | "create" | "update" | "delete" | "reject";
+  collectionName: "donations" | "expenses" | "notices";
+  details: string;
+  timestamp: Date;
 }
 
 // ==========================================
@@ -83,7 +92,7 @@ function mapDonationDoc(doc: QueryDocumentSnapshot<DocumentData>): Donation {
     date: toDate(data.date),
     trxId: data.trxId,
     paymentMethod: data.paymentMethod,
-    category: data.category || "General",
+    category: data.category || "general_fund",
     isAnonymous: !!data.isAnonymous,
     status: data.status || "pending",
   };
@@ -93,11 +102,11 @@ function mapExpenseDoc(doc: QueryDocumentSnapshot<DocumentData>): Expense {
   const data = doc.data();
   return {
     id: doc.id,
-    category: data.category || "General",
+    category: data.category || "miscellaneous",
     amount: Number(data.amount) || 0,
     date: toDate(data.date),
     description: data.description || "",
-    voucherUrl: data.voucherUrl,
+    voucherUrl: data.voucherUrl || null,
   };
 }
 
@@ -107,7 +116,6 @@ function mapNoticeDoc(doc: QueryDocumentSnapshot<DocumentData>): Notice {
     id: doc.id,
     title: data.title || "",
     content: data.content || "",
-    imageUrl: data.imageUrl,
     date: toDate(data.date),
   };
 }
@@ -116,9 +124,6 @@ function mapNoticeDoc(doc: QueryDocumentSnapshot<DocumentData>): Notice {
 // 3. User & Authentication Utilities
 // ==========================================
 
-/**
- * Sets or updates a user profile and role in the database.
- */
 export async function setUserProfile(email: string, role: UserRole): Promise<void> {
   const usersCollection = collection(db, "users");
   const q = query(usersCollection, where("email", "==", email.toLowerCase()));
@@ -135,9 +140,6 @@ export async function setUserProfile(email: string, role: UserRole): Promise<voi
   }
 }
 
-/**
- * Fetches a user profile by email to verify administrative permissions.
- */
 export async function getUserProfile(email: string): Promise<UserProfile | null> {
   const usersCollection = collection(db, "users");
   const q = query(usersCollection, where("email", "==", email.toLowerCase()));
@@ -153,107 +155,286 @@ export async function getUserProfile(email: string): Promise<UserProfile | null>
 }
 
 // ==========================================
-// 4. Donation Utilities (CRUD)
+// 4. Audit Log Utilities
 // ==========================================
 
 /**
- * Submits a new donation. Default status is 'pending'.
+ * Creates an accountability audit log in the database.
  */
-export async function addDonation(donation: Omit<Donation, "id" | "status" | "date"> & { date?: Date, status?: "pending" | "approved" }): Promise<string> {
-  const donationsCollection = collection(db, "donations");
-  const docRef = await addDoc(donationsCollection, {
-    ...donation,
-    status: donation.status || "pending",
-    date: donation.date || new Date(),
+export async function addAuditLog(log: Omit<AuditLog, "id" | "timestamp">): Promise<string> {
+  const auditLogsCol = collection(db, "auditLogs");
+  const docRef = await addDoc(auditLogsCol, {
+    ...log,
+    timestamp: new Date(),
   });
   return docRef.id;
 }
 
 /**
- * Changes a donation's status to 'approved'.
+ * Fetches all audit logs, sorted chronologically descending.
  */
-export async function approveDonation(donationId: string): Promise<void> {
+export async function getAuditLogs(): Promise<AuditLog[]> {
+  const auditLogsCol = collection(db, "auditLogs");
+  const snapshot = await getDocs(auditLogsCol);
+  const mapped = snapshot.docs.map((doc) => {
+    const d = doc.data();
+    return {
+      id: doc.id,
+      adminEmail: d.adminEmail || "Unknown Admin",
+      actionType: d.actionType as any,
+      collectionName: d.collectionName as any,
+      details: d.details || "",
+      timestamp: toDate(d.timestamp),
+    };
+  });
+  return mapped.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+}
+
+// ==========================================
+// 5. Firebase Storage Utilities
+// ==========================================
+
+/**
+ * Uploads a voucher image directly to Firebase Storage and returns the downloadURL.
+ */
+export async function uploadVoucherImage(file: File): Promise<string> {
+  const fileRef = ref(storage, `vouchers/${Date.now()}_${file.name}`);
+  const snapshot = await uploadBytes(fileRef, file);
+  return await getDownloadURL(snapshot.ref);
+}
+
+// ==========================================
+// 6. Donation Utilities (CRUD with Accountability)
+// ==========================================
+
+export async function addDonation(
+  donation: Omit<Donation, "id" | "status" | "date"> & { date?: Date; status?: "pending" | "approved" | "rejected" },
+  adminEmail?: string
+): Promise<string> {
+  const donationsCollection = collection(db, "donations");
+  const status = donation.status || "pending";
+  const docRef = await addDoc(donationsCollection, {
+    ...donation,
+    status,
+    date: donation.date || new Date(),
+  });
+
+  if (adminEmail) {
+    await addAuditLog({
+      adminEmail,
+      actionType: "create",
+      collectionName: "donations",
+      details: `Logged manual Cash donation of ৳${donation.amount} from ${donation.donorName || "Anonymous"} (${donation.category})`,
+    });
+  }
+  return docRef.id;
+}
+
+export async function approveDonation(donationId: string, adminEmail: string): Promise<void> {
   const docRef = doc(db, "donations", donationId);
+  const snapshot = await getDoc(docRef);
+  const data = snapshot.data();
+  const amount = data ? Number(data.amount) || 0 : 0;
+  const donor = data ? (data.isAnonymous ? "Anonymous" : data.donorName || "Anonymous") : "Unknown";
+
   await updateDoc(docRef, {
     status: "approved",
   });
+
+  await addAuditLog({
+    adminEmail,
+    actionType: "approve",
+    collectionName: "donations",
+    details: `Approved donation claim of ৳${amount} by ${donor}`,
+  });
 }
 
-/**
- * Fetches all donations of a specific status, ordered by date descending.
- */
-export async function getDonations(status?: "pending" | "approved"): Promise<Donation[]> {
+export async function rejectDonation(donationId: string, adminEmail: string): Promise<void> {
+  const docRef = doc(db, "donations", donationId);
+  const snapshot = await getDoc(docRef);
+  const data = snapshot.data();
+  const amount = data ? Number(data.amount) || 0 : 0;
+  const donor = data ? (data.isAnonymous ? "Anonymous" : data.donorName || "Anonymous") : "Unknown";
+
+  await updateDoc(docRef, {
+    status: "rejected",
+  });
+
+  await addAuditLog({
+    adminEmail,
+    actionType: "reject",
+    collectionName: "donations",
+    details: `Rejected donation claim of ৳${amount} by ${donor} (Soft deleted into Rejected Logs)`,
+  });
+}
+
+export async function updateDonation(donationId: string, donation: Partial<Donation>, adminEmail: string): Promise<void> {
+  const docRef = doc(db, "donations", donationId);
+  const snapshot = await getDoc(docRef);
+  const oldData = snapshot.data();
+
+  await updateDoc(docRef, {
+    ...donation,
+  });
+
+  await addAuditLog({
+    adminEmail,
+    actionType: "update",
+    collectionName: "donations",
+    details: `Updated donation record: Amount: ৳${oldData?.amount || 0} -> ৳${donation.amount || oldData?.amount || 0}, Donor: "${oldData?.donorName || "Anonymous"}" -> "${donation.donorName || oldData?.donorName || "Anonymous"}"`,
+  });
+}
+
+export async function deleteDonation(donationId: string, adminEmail: string): Promise<void> {
+  const docRef = doc(db, "donations", donationId);
+  const snapshot = await getDoc(docRef);
+  const data = snapshot.data();
+
+  await deleteDoc(docRef);
+
+  await addAuditLog({
+    adminEmail,
+    actionType: "delete",
+    collectionName: "donations",
+    details: `Deleted donation record of ৳${data?.amount || 0} by "${data?.isAnonymous ? "Anonymous" : data?.donorName || "Anonymous"}"`,
+  });
+}
+
+export async function getDonations(status?: "pending" | "approved" | "rejected"): Promise<Donation[]> {
   const donationsCollection = collection(db, "donations");
   let q = query(donationsCollection);
-  
+
   if (status) {
     q = query(donationsCollection, where("status", "==", status));
   }
-  
+
   const snapshot = await getDocs(q);
   const mapped = snapshot.docs.map(mapDonationDoc);
-  // Sort in JavaScript to avoid requiring composite indexes
   return mapped.sort((a, b) => b.date.getTime() - a.date.getTime());
 }
 
 // ==========================================
-// 5. Expense Utilities (CRUD)
+// 7. Expense Utilities (CRUD with Accountability)
 // ==========================================
 
-/**
- * Adds a new expense record.
- */
-export async function addExpense(expense: Omit<Expense, "id" | "date"> & { date?: Date }): Promise<string> {
+export async function addExpense(expense: Omit<Expense, "id" | "date"> & { date?: Date }, adminEmail: string): Promise<string> {
   const expensesCollection = collection(db, "expenses");
   const docRef = await addDoc(expensesCollection, {
     ...expense,
     date: expense.date || new Date(),
   });
+
+  await addAuditLog({
+    adminEmail,
+    actionType: "create",
+    collectionName: "expenses",
+    details: `Recorded expense of ৳${expense.amount} under category "${expense.category}" - "${expense.description}"`,
+  });
   return docRef.id;
 }
 
-/**
- * Fetches all expenses, ordered by date descending.
- */
+export async function updateExpense(expenseId: string, expense: Partial<Expense>, adminEmail: string): Promise<void> {
+  const docRef = doc(db, "expenses", expenseId);
+  const snapshot = await getDoc(docRef);
+  const oldData = snapshot.data();
+
+  await updateDoc(docRef, {
+    ...expense,
+  });
+
+  await addAuditLog({
+    adminEmail,
+    actionType: "update",
+    collectionName: "expenses",
+    details: `Updated expense: Amount: ৳${oldData?.amount || 0} -> ৳${expense.amount || oldData?.amount || 0}, Details: "${oldData?.description || ""}" -> "${expense.description || oldData?.description || ""}"`,
+  });
+}
+
+export async function deleteExpense(expenseId: string, adminEmail: string): Promise<void> {
+  const docRef = doc(db, "expenses", expenseId);
+  const snapshot = await getDoc(docRef);
+  const data = snapshot.data();
+
+  await deleteDoc(docRef);
+
+  await addAuditLog({
+    adminEmail,
+    actionType: "delete",
+    collectionName: "expenses",
+    details: `Deleted expense record of ৳${data?.amount || 0} ("${data?.description || ""}")`,
+  });
+}
+
 export async function getExpenses(): Promise<Expense[]> {
   const expensesCollection = collection(db, "expenses");
   const q = query(expensesCollection);
   const snapshot = await getDocs(q);
   const mapped = snapshot.docs.map(mapExpenseDoc);
-  // Sort in JavaScript to avoid requiring composite indexes
   return mapped.sort((a, b) => b.date.getTime() - a.date.getTime());
 }
 
 // ==========================================
-// 6. Notice Board Utilities (CRUD)
+// 8. Notice Board Utilities (CRUD with Accountability)
 // ==========================================
 
-/**
- * Creates a new notice for the public/dashboard notice board.
- */
-export async function addNotice(notice: Omit<Notice, "id" | "date"> & { date?: Date }): Promise<string> {
+export async function addNotice(notice: Omit<Notice, "id" | "date"> & { date?: Date }, adminEmail: string): Promise<string> {
   const noticesCollection = collection(db, "notices");
   const docRef = await addDoc(noticesCollection, {
     ...notice,
     date: notice.date || new Date(),
   });
+
+  await addAuditLog({
+    adminEmail,
+    actionType: "create",
+    collectionName: "notices",
+    details: `Published notice: "${notice.title}"`,
+  });
   return docRef.id;
 }
 
-/**
- * Fetches all notices, ordered by date descending.
- */
+export async function updateNotice(noticeId: string, notice: Partial<Notice>, adminEmail: string): Promise<void> {
+  const docRef = doc(db, "notices", noticeId);
+  const snapshot = await getDoc(docRef);
+  const oldData = snapshot.data();
+
+  await updateDoc(docRef, {
+    ...notice,
+  });
+
+  await addAuditLog({
+    adminEmail,
+    actionType: "update",
+    collectionName: "notices",
+    details: `Updated notice: Title: "${oldData?.title || ""}" -> "${notice.title || oldData?.title || ""}"`,
+  });
+}
+
+export async function deleteNotice(noticeId: string, adminEmail: string): Promise<void> {
+  const docRef = doc(db, "notices", noticeId);
+  const snapshot = await getDoc(docRef);
+  const data = snapshot.data();
+
+  await deleteDoc(docRef);
+
+  await addAuditLog({
+    adminEmail,
+    actionType: "delete",
+    collectionName: "notices",
+    details: `Deleted notice: "${data?.title || ""}"`,
+  });
+}
+
 export async function getNotices(): Promise<Notice[]> {
   const noticesCollection = collection(db, "notices");
   const q = query(noticesCollection);
   const snapshot = await getDocs(q);
   const mapped = snapshot.docs.map(mapNoticeDoc);
-  // Sort in JavaScript to avoid requiring composite indexes
   return mapped.sort((a, b) => b.date.getTime() - a.date.getTime());
 }
 
 // ==========================================
-// 7. Aggregated Dashboard Stats (Analytics)
+// 9. Aggregated Dashboard Stats (Analytics)
 // ==========================================
 
 export interface CategorySummary {
@@ -268,17 +449,10 @@ export interface DashboardStats {
   expenseByCategory: CategorySummary;
 }
 
-/**
- * Fetches aggregated financial summary data (income and expenses).
- * - Filters by optional startDate and endDate.
- * - Restricts income to only 'approved' donations.
- * - Groups income and expenses by category.
- */
 export async function getDashboardStats(startDate?: Date, endDate?: Date): Promise<DashboardStats> {
   const donationsCollection = collection(db, "donations");
   const expensesCollection = collection(db, "expenses");
 
-  // Fetch approved donations and all expenses
   const donationsQuery = query(donationsCollection, where("status", "==", "approved"));
   const expensesQuery = query(expensesCollection);
 
@@ -287,38 +461,34 @@ export async function getDashboardStats(startDate?: Date, endDate?: Date): Promi
     getDocs(expensesQuery),
   ]);
 
-  // Process income (approved donations)
   let totalIncome = 0;
   const incomeByCategory: CategorySummary = {};
 
   donationsSnapshot.docs.forEach((doc) => {
     const data = doc.data();
     const amount = Number(data.amount) || 0;
-    const category = data.category || "General";
+    const category = data.category || "general_fund";
     const date = toDate(data.date);
 
-    // Apply date filters in JavaScript
     if (startDate && date < startDate) return;
     if (endDate && date > endDate) return;
-    
+
     totalIncome += amount;
     incomeByCategory[category] = (incomeByCategory[category] || 0) + amount;
   });
 
-  // Process expenses
   let totalExpenses = 0;
   const expenseByCategory: CategorySummary = {};
 
   expensesSnapshot.docs.forEach((doc) => {
     const data = doc.data();
     const amount = Number(data.amount) || 0;
-    const category = data.category || "General";
+    const category = data.category || "miscellaneous";
     const date = toDate(data.date);
 
-    // Apply date filters in JavaScript
     if (startDate && date < startDate) return;
     if (endDate && date > endDate) return;
-    
+
     totalExpenses += amount;
     expenseByCategory[category] = (expenseByCategory[category] || 0) + amount;
   });

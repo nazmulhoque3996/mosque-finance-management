@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import jsPDF from "jspdf";
 import {
   addDonation,
   getDonations,
@@ -252,6 +253,22 @@ function formatDate(date: Date, lang: "bn" | "en"): string {
   });
 }
 
+export function translateCategory(cat: string, lang: "bn" | "en"): string {
+  const dictionary: Record<string, Record<"bn" | "en", string>> = {
+    // Donations
+    jumma_collection: { bn: "জুমা আদায়", en: "Jumma Collection" },
+    general_fund: { bn: "সাধারণ দান (লিল্লাহ)", en: "General Donation (Lillah)" },
+    mosque_development: { bn: "মসজিদ উন্নয়ন", en: "Mosque Development" },
+    // Expenses
+    salary: { bn: "ভাতা / সম্মানী", en: "Allowance / Salary" },
+    utilities: { bn: "বিদ্যুৎ / ইউটিলিটি বিল", en: "Electricity / Utilities" },
+    maintenance: { bn: "মেরামত ও রক্ষণাবেক্ষণ", en: "Repairs & Maintenance" },
+    miscellaneous: { bn: "অন্যান্য খরচ", en: "Miscellaneous Expenses" },
+  };
+
+  return dictionary[cat]?.[lang] || cat;
+}
+
 // ==========================================
 // 3. Main React Component
 // ==========================================
@@ -312,6 +329,101 @@ export default function Home() {
     }, 6000);
   };
 
+  const handleDownloadReceiptPdf = (d: Donation) => {
+    const doc = new jsPDF({
+      orientation: "portrait",
+      unit: "mm",
+      format: "a5"
+    });
+
+    // Green accent banner
+    doc.setFillColor(6, 78, 59); // deep emerald
+    doc.rect(0, 0, 148, 25, "F");
+
+    // Title
+    doc.setTextColor(255, 255, 255);
+    doc.setFont("Helvetica", "bold");
+    doc.setFontSize(14);
+    doc.text("Subedar Jame Masjid Al Khawari", 74, 10, { align: "center" });
+
+    doc.setFont("Helvetica", "normal");
+    doc.setFontSize(8);
+    doc.text("South Mirer Khil, Hathazari, Chattogram", 74, 15, { align: "center" });
+    doc.text("Digital Mosque Management System", 74, 19, { align: "center" });
+
+    // Receipt Header
+    doc.setTextColor(30, 41, 59);
+    doc.setFont("Helvetica", "bold");
+    doc.setFontSize(12);
+    doc.text("OFFICIAL DONATION RECEIPT", 74, 38, { align: "center" });
+
+    // Divider
+    doc.setDrawColor(226, 232, 240);
+    doc.setLineWidth(0.5);
+    doc.line(15, 42, 133, 42);
+
+    const drawRow = (label: string, value: string, y: number) => {
+      doc.setFont("Helvetica", "bold");
+      doc.setTextColor(100, 116, 139);
+      doc.text(label, 20, y);
+      doc.setFont("Helvetica", "normal");
+      doc.setTextColor(15, 23, 42);
+      doc.text(value, 60, y);
+    };
+
+    const formattedDate = d.date.toLocaleDateString("en-US", { day: "numeric", month: "long", year: "numeric" });
+    const formattedCategory = translateCategory(d.category, "en");
+
+    drawRow("Receipt ID:", `REC-${d.id?.substring(0, 6).toUpperCase() || "TEMP"}`, 52);
+    drawRow("Date:", formattedDate, 60);
+    drawRow("Donor Name:", d.isAnonymous ? "Anonymous Donor" : d.donorName || "Anonymous", 68);
+    drawRow("Category:", formattedCategory, 76);
+    drawRow("Payment Method:", d.paymentMethod.toUpperCase(), 84);
+    drawRow("Transaction ID:", d.trxId || "N/A (Cash Entry)", 92);
+    
+    // Highlight Amount Box
+    doc.setFillColor(240, 253, 250);
+    doc.rect(20, 98, 108, 14, "F");
+    doc.setDrawColor(204, 251, 241);
+    doc.rect(20, 98, 108, 14, "S");
+
+    doc.setFont("Helvetica", "bold");
+    doc.setFontSize(10);
+    doc.setTextColor(13, 148, 136); // teal-600
+    doc.text("TOTAL AMOUNT RECEIVED:", 25, 107);
+    doc.setFontSize(11);
+    doc.text(`BDT ${d.amount.toLocaleString()}.00`, 85, 107);
+
+    // Status Badge
+    doc.setFillColor(220, 252, 231);
+    doc.rect(54, 118, 40, 8, "F");
+    doc.setFont("Helvetica", "bold");
+    doc.setFontSize(8);
+    doc.setTextColor(21, 128, 61);
+    doc.text("VERIFIED & APPROVED", 74, 123, { align: "center" });
+
+    // Committee Signatures
+    doc.setFont("Helvetica", "normal");
+    doc.setFontSize(7);
+    doc.setTextColor(100, 116, 139);
+    
+    doc.line(20, 180, 55, 180);
+    doc.text("Masjid Treasurer", 37, 184, { align: "center" });
+    
+    doc.line(93, 180, 128, 180);
+    doc.text("Mosque Committee President", 110, 184, { align: "center" });
+
+    // Footer bar
+    doc.setFillColor(248, 250, 252);
+    doc.rect(0, 195, 148, 15, "F");
+    doc.setFontSize(7);
+    doc.setTextColor(148, 163, 184);
+    doc.text("Thank you for your generous contribution. May Allah accept your donation.", 74, 201, { align: "center" });
+    doc.text("This receipt was generated digitally by Subedar Jame Masjid Al Khawari digital management system.", 74, 204, { align: "center" });
+
+    doc.save(`Masjid-Receipt-${d.id?.substring(0, 6).toUpperCase() || "CASH"}.pdf`);
+  };
+
   // --- Safe Hydration Mount ---
   useEffect(() => {
     setMounted(true);
@@ -351,7 +463,7 @@ export default function Home() {
               donorName: "Haji Mohammad Yusuf",
               amount: 15000,
               date: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000), // 3 days ago
-              category: translations.bn.catDevelopment,
+              category: "mosque_development",
               paymentMethod: "bank",
               trxId: "TXN1029384",
               isAnonymous: false,
@@ -361,7 +473,7 @@ export default function Home() {
               donorName: "",
               amount: 850,
               date: new Date(Date.now() - 10 * 60 * 60 * 1000), // 10 hours ago
-              category: translations.bn.catJumma,
+              category: "jumma_collection",
               paymentMethod: "bkash",
               trxId: "BK894J92L",
               isAnonymous: true,
@@ -371,7 +483,7 @@ export default function Home() {
               donorName: "Tasnim Rahman",
               amount: 3500,
               date: new Date(Date.now() - 1 * 24 * 60 * 60 * 1000), // 1 day ago
-              category: translations.bn.catGeneral,
+              category: "general_fund",
               paymentMethod: "nagad",
               trxId: "NG908234D",
               isAnonymous: false,
@@ -382,7 +494,7 @@ export default function Home() {
               donorName: "Shafiul Alam",
               amount: 2000,
               date: new Date(),
-              category: translations.bn.catDevelopment,
+              category: "mosque_development",
               paymentMethod: "rocket",
               trxId: "RC849F01K",
               isAnonymous: false,
@@ -393,13 +505,13 @@ export default function Home() {
           // 2. Add approved sample expenses
           await Promise.all([
             addDoc(expensesCol, {
-              category: "Maintenance",
+              category: "maintenance",
               amount: 3200,
               date: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000), // 5 days ago (Within Week/Month)
               description: "Mosque Ceiling Fan Repair and Rewiring (মসজিদের সিলিং ফ্যান মেরামত ও ওয়ারিং বিল)",
             }),
             addDoc(expensesCol, {
-              category: "Salary",
+              category: "salary",
               amount: 12000,
               date: new Date(Date.now() - 15 * 24 * 60 * 60 * 1000), // 15 days ago (Within Month)
               description: "Muazzin Monthly Allowance (মুয়াজ্জিন সাহেবের মাসিক সম্মানী ভাতা)",
@@ -819,9 +931,9 @@ export default function Home() {
                   required
                 >
                   <option value="" disabled>{t.categorySelect}</option>
-                  <option value={t.catJumma}>{t.catJumma}</option>
-                  <option value={t.catGeneral}>{t.catGeneral}</option>
-                  <option value={t.catDevelopment}>{t.catDevelopment}</option>
+                  <option value="jumma_collection">{t.catJumma}</option>
+                  <option value="general_fund">{t.catGeneral}</option>
+                  <option value="mosque_development">{t.catDevelopment}</option>
                 </select>
               </div>
 
@@ -1138,7 +1250,7 @@ export default function Home() {
                                 </td>
                                 <td className="py-3 px-2 text-slate-600 hidden sm:table-cell text-center">
                                   <span className="inline-block text-[10px] font-bold px-2.5 py-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-100">
-                                    {d.category}
+                                    {translateCategory(d.category, lang)}
                                   </span>
                                 </td>
                                 <td className="py-3 px-2 text-slate-500 whitespace-nowrap text-center">
@@ -1187,7 +1299,7 @@ export default function Home() {
                                 </td>
                                 <td className="py-3.5 px-2 text-slate-600 hidden sm:table-cell text-center whitespace-nowrap">
                                   <span className="text-[10px] font-bold px-2.5 py-1 rounded-full bg-amber-50 text-amber-700 border border-amber-100">
-                                    {e.category}
+                                    {translateCategory(e.category, lang)}
                                   </span>
                                 </td>
                               </tr>
