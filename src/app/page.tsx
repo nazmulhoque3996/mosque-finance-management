@@ -1120,7 +1120,10 @@ export default function Home() {
                     </div>
 
                     <button
-                      onClick={() => triggerToast("success", lang === "bn" ? "ডাউনলোড শুরু হচ্ছে..." : "Starting download...", lang === "bn" ? "দান রশিদ PDF প্রস্তুত করা হচ্ছে।" : "Preparing donation receipt PDF.")}
+                      onClick={() => {
+                        triggerToast("success", lang === "bn" ? "ডাউনলোড শুরু হচ্ছে..." : "Starting download...", lang === "bn" ? "দান রশিদ PDF প্রস্তুত করা হচ্ছে।" : "Preparing donation receipt PDF.");
+                        handleDownloadReceiptPdf(trackResult);
+                      }}
                       className="mt-4 w-full py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold transition-all active:scale-[0.99] flex items-center justify-center gap-1.5 cursor-pointer shadow-sm shadow-emerald-950/15"
                     >
                       <Download className="w-4 h-4" />

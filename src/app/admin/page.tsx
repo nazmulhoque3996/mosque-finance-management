@@ -7,6 +7,7 @@ import {
   signOut,
   onAuthStateChanged,
   User as FirebaseUser,
+  sendPasswordResetEmail,
 } from "firebase/auth";
 import {
   collection,
@@ -21,7 +22,8 @@ import {
   where,
   setDoc,
 } from "firebase/firestore";
-import { auth, db } from "@/lib/firebase";
+import { auth, db, firebaseConfig } from "@/lib/firebase";
+import { initializeApp, deleteApp } from "firebase/app";
 import {
   getUserProfile,
   setUserProfile,
@@ -43,7 +45,7 @@ import {
   toDate,
   getAuditLogs,
   addAuditLog,
-  uploadVoucherImage,
+  convertFileToBase64,
   getSystemSettings,
   updateSystemSettings,
   generateReceiptId,
@@ -462,6 +464,7 @@ export default function AdminPage() {
   // --- Form: SuperAdmin Manage ---
   const [newAdminEmail, setNewAdminEmail] = useState("");
   const [newAdminRole, setNewAdminRole] = useState<UserRole>("admin");
+  const [newAdminPassword, setNewAdminPassword] = useState("");
 
   // --- Edit Modals States ---
   const [editingDonation, setEditingDonation] = useState<Donation | null>(null);
@@ -927,7 +930,18 @@ export default function AdminPage() {
       let voucherUrl: string | null = null;
       
       if (expFile) {
-        voucherUrl = await uploadVoucherImage(expFile);
+        if (expFile.size > 500 * 1024) {
+          triggerToast(
+            "error",
+            t.saveError,
+            lang === "bn"
+              ? "ভাউচার ফাইলের সাইজ ৫০০KB এর কম হতে হবে।"
+              : "Voucher file must be under 500KB!"
+          );
+          setSubmitting(false);
+          return;
+        }
+        voucherUrl = await convertFileToBase64(expFile);
       }
 
       await addExpense({
@@ -947,17 +961,11 @@ export default function AdminPage() {
       await loadAdminData();
     } catch (err: any) {
       console.error("Error adding expense:", err);
-      if (err.message && (err.message.includes("Storage") || err.message.includes("timeout") || err.message.includes("permission") || err.message.includes("unauthorized"))) {
-        triggerToast(
-          "error",
-          lang === "bn" ? "ভাউচার আপলোড ব্যর্থতা!" : "Storage Upload Failed",
-          lang === "bn"
-            ? "ফাইল আপলোড ব্যর্থ হয়েছে! এটি স্টোরেজ সিকিউরিটি রুলস (Write Denied) অথবা নেটওয়ার্ক টাইমআউটের কারণে হতে পারে।"
-            : "Firebase Storage upload failed: Permission Denied by security rules or upload timed out (12s limit reached)."
-        );
-      } else {
-        triggerToast("error", t.saveError, t.saveError);
-      }
+      triggerToast(
+        "error",
+        t.saveError,
+        err.message || (lang === "bn" ? "খরচ সংরক্ষণ করতে ব্যর্থ হয়েছে।" : "Failed to add expense.")
+      );
     } finally {
       setSubmitting(false);
     }
@@ -1131,7 +1139,7 @@ export default function AdminPage() {
           setSavingSettings(false);
           return;
         }
-        presidentSignatureUrl = await uploadVoucherImage(presSigFile);
+        presidentSignatureUrl = await convertFileToBase64(presSigFile);
       }
 
       if (treasSigFile) {
@@ -1140,7 +1148,7 @@ export default function AdminPage() {
           setSavingSettings(false);
           return;
         }
-        treasurerSignatureUrl = await uploadVoucherImage(treasSigFile);
+        treasurerSignatureUrl = await convertFileToBase64(treasSigFile);
       }
 
       await updateSystemSettings({
@@ -1156,17 +1164,11 @@ export default function AdminPage() {
       triggerToast("success", t.saveSuccess, lang === "bn" ? "স্বাক্ষর সফলভাবে সংরক্ষিত হয়েছে!" : "Signatures saved successfully!");
     } catch (err: any) {
       console.error("Error saving signatures:", err);
-      if (err.message && (err.message.includes("Storage") || err.message.includes("timeout") || err.message.includes("permission") || err.message.includes("unauthorized"))) {
-        triggerToast(
-          "error",
-          lang === "bn" ? "স্বাক্ষর আপলোড ব্যর্থতা!" : "Signature Upload Failed",
-          lang === "bn"
-            ? "ডিজিটাল স্বাক্ষর ফাইল আপলোড করতে সমস্যা হয়েছে! এটি ফায়ারবেস সিকিউরিটি রুলস বা টাইমআউটের কারণে হতে পারে।"
-            : "Firebase Storage error: Upload timed out or writes are denied by security rules. Please check your storage bucket rules."
-        );
-      } else {
-        triggerToast("error", t.saveError, lang === "bn" ? "সংরক্ষণ করতে সমস্যা হয়েছে!" : "Failed to save signatures!");
-      }
+      triggerToast(
+        "error",
+        t.saveError,
+        err.message || (lang === "bn" ? "সংরক্ষণ করতে সমস্যা হয়েছে!" : "Failed to save signatures!")
+      );
     } finally {
       setSavingSettings(false);
     }
@@ -1183,10 +1185,76 @@ export default function AdminPage() {
       setSubmitting(true);
       const userRef = doc(db, "users", adminId);
       await deleteDoc(userRef);
+      
+      // Audit Logging
+      if (adminProfile) {
+        await addAuditLog({
+          adminEmail: adminProfile.email,
+          actionType: "delete",
+          collectionName: "notices" as any,
+          details: `Deleted admin account: ${email}`
+        });
+      }
+
       triggerToast("success", t.saveSuccess, lang === "bn" ? "অ্যাডমিন অপসারণ করা হয়েছে।" : "Admin removed successfully.");
       await loadAdminData();
     } catch (err) {
       triggerToast("error", t.saveError, t.saveError);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  // --- SuperAdmin: Toggle Admin Role ---
+  const handleToggleAdminRole = async (adm: UserProfile) => {
+    if (adm.email.toLowerCase() === "superadmin@masjid.com" || adm.email.toLowerCase() === adminProfile?.email.toLowerCase()) {
+      triggerToast("error", t.saveError, lang === "bn" ? "প্রধান বা সক্রিয় সুপার অ্যাডমিনের ভূমিকা পরিবর্তন করা যাবে না!" : "Cannot change role of core/active superadmin!");
+      return;
+    }
+
+    try {
+      setSubmitting(true);
+      const newRole: UserRole = adm.role === "superadmin" ? "admin" : "superadmin";
+      await setUserProfile(adm.email, newRole);
+
+      // Audit Logging
+      if (adminProfile) {
+        await addAuditLog({
+          adminEmail: adminProfile.email,
+          actionType: "update",
+          collectionName: "notices" as any,
+          details: `Updated role of admin ${adm.email} from ${adm.role} to ${newRole}`
+        });
+      }
+
+      triggerToast("success", t.saveSuccess, lang === "bn" ? "অ্যাডমিনের ভূমিকা সফলভাবে পরিবর্তন করা হয়েছে।" : "Admin role changed successfully.");
+      await loadAdminData();
+    } catch (err: any) {
+      triggerToast("error", t.saveError, err.message || t.saveError);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  // --- SuperAdmin: Send Admin Password Reset Email ---
+  const handleResetAdminPassword = async (email: string) => {
+    try {
+      setSubmitting(true);
+      await sendPasswordResetEmail(auth, email);
+
+      // Audit Logging
+      if (adminProfile) {
+        await addAuditLog({
+          adminEmail: adminProfile.email,
+          actionType: "update",
+          collectionName: "notices" as any,
+          details: `Triggered password reset email for admin: ${email}`
+        });
+      }
+
+      triggerToast("success", lang === "bn" ? "রিসেট ইমেইল পাঠানো হয়েছে!" : "Reset Email Sent", lang === "bn" ? "পাসওয়ার্ড রিসেট ইমেইল সফলভাবে পাঠানো হয়েছে।" : "Password reset email sent successfully.");
+    } catch (err: any) {
+      triggerToast("error", t.saveError, err.message || t.saveError);
     } finally {
       setSubmitting(false);
     }
@@ -1370,7 +1438,7 @@ export default function AdminPage() {
           ========================================== */}
       <header className="relative bg-gradient-to-r from-emerald-950 via-emerald-800 to-teal-950 text-white shadow-lg overflow-hidden">
         <div className="absolute inset-0 opacity-10 bg-[radial-gradient(#fff_1px,transparent_1px)] [background-size:16px_16px]"></div>
-        <div className="max-w-5xl mx-auto px-4 py-6 relative flex flex-col sm:flex-row items-center justify-between gap-4">
+        <div className="w-full max-w-[98%] xl:max-w-[95%] mx-auto px-4 md:px-8 py-6 relative flex flex-col sm:flex-row items-center justify-between gap-4">
           
           <div className="flex items-center gap-4 text-center sm:text-left">
             <div className="w-12 h-12 rounded-xl bg-white/10 flex items-center justify-center border border-white/20">
@@ -1512,7 +1580,7 @@ export default function AdminPage() {
         // ==========================================
         // 2. AUTHENTICATED ADMIN CONTROL dashboard
         // ==========================================
-        <main className="max-w-5xl mx-auto px-4 mt-6 grid grid-cols-1 md:grid-cols-4 gap-6">
+        <main className="w-full max-w-[98%] xl:max-w-[95%] mx-auto px-4 md:px-8 mt-6 grid grid-cols-1 md:grid-cols-4 gap-6">
           
           {/* Left panel sidebar tabs */}
           <section className="md:col-span-1 space-y-2">
@@ -2785,9 +2853,9 @@ export default function AdminPage() {
                   </div>
 
                   {/* Add Admin Mappings */}
-                  <div className="bg-gray-50/50 p-5 rounded-2xl border border-gray-100 max-w-xl mx-auto">
+                  <div className="bg-gray-50/50 p-5 rounded-2xl border border-gray-100 max-w-4xl mx-auto">
                     <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wide mb-3">{t.addAdminTitle}</h3>
-                    <form onSubmit={handleAddAdmin} className="flex flex-col sm:flex-row gap-3">
+                    <form onSubmit={handleAddAdmin} className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
                       <div className="flex-1">
                         <input
                           type="email"
@@ -2798,8 +2866,19 @@ export default function AdminPage() {
                           required
                         />
                       </div>
+
+                      <div className="flex-1">
+                        <input
+                          type="password"
+                          value={newAdminPassword}
+                          onChange={(e) => setNewAdminPassword(e.target.value)}
+                          placeholder={lang === "bn" ? "পাসওয়ার্ড দিন" : "Enter Password"}
+                          className="w-full h-11 px-3.5 rounded-xl border border-gray-200 bg-white shadow-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 text-sm font-normal placeholder-slate-400"
+                          required
+                        />
+                      </div>
                       
-                      <div className="w-full sm:w-48">
+                      <div className="w-full">
                         <select
                           value={newAdminRole}
                           onChange={(e) => setNewAdminRole(e.target.value as any)}
@@ -2829,25 +2908,51 @@ export default function AdminPage() {
                         <Loader2 className="w-6 h-6 animate-spin text-emerald-600" />
                       </div>
                     ) : (
-                      <div className="divide-y divide-gray-100">
+                      <div className="bg-white border border-gray-100 rounded-2xl shadow-sm divide-y divide-gray-100">
                         {allAdmins.map((adm) => (
-                          <div key={adm.id} className="py-3 flex items-center justify-between gap-3 text-xs sm:text-sm">
-                            <div className="flex items-center gap-2">
+                          <div key={adm.id} className="p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4 text-xs sm:text-sm">
+                            <div className="flex items-center gap-3">
                               <span className="font-extrabold text-slate-900">{adm.email}</span>
-                              <span className={`text-[9px] px-2 py-0.5 rounded-full font-bold uppercase ${
+                              <span className={`text-[9px] px-2 py-0.5 rounded-full font-bold uppercase tracking-wider ${
                                 adm.role === "superadmin" ? "bg-purple-100 text-purple-700" : "bg-emerald-100 text-emerald-700"
                               }`}>
                                 {adm.role === "superadmin" ? "Super" : "Admin"}
                               </span>
                             </div>
                             
-                            <button
-                              onClick={() => handleRemoveAdmin(adm.id!, adm.email)}
-                              className="text-xs font-bold text-red-600 hover:text-red-800 p-1 flex items-center gap-1 cursor-pointer"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                              <span>{t.removeBtn}</span>
-                            </button>
+                            <div className="flex items-center gap-2.5 flex-wrap">
+                              {/* Toggle Role Button */}
+                              <button
+                                onClick={() => handleToggleAdminRole(adm)}
+                                disabled={submitting}
+                                className="text-xs font-bold text-slate-600 hover:text-emerald-750 px-2 py-1 rounded-lg border border-slate-200 hover:border-emerald-200 hover:bg-emerald-50 transition-all flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                                title={lang === "bn" ? "ভূমিকা পরিবর্তন করুন" : "Change Role"}
+                              >
+                                <Shield className="w-3.5 h-3.5 text-emerald-700" />
+                                <span>{lang === "bn" ? "ভূমিকা পরিবর্তন" : "Change Role"}</span>
+                              </button>
+
+                              {/* Reset Password Button */}
+                              <button
+                                onClick={() => handleResetAdminPassword(adm.email)}
+                                disabled={submitting}
+                                className="text-xs font-bold text-slate-600 hover:text-sky-750 px-2 py-1 rounded-lg border border-slate-200 hover:border-sky-200 hover:bg-sky-50 transition-all flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                                title={lang === "bn" ? "পাসওয়ার্ড রিসেট ইমেইল পাঠান" : "Send Reset Email"}
+                              >
+                                <Lock className="w-3.5 h-3.5 text-sky-700" />
+                                <span>{lang === "bn" ? "পাসওয়ার্ড রিসেট" : "Reset Password"}</span>
+                              </button>
+                              
+                              {/* Delete Button */}
+                              <button
+                                onClick={() => handleRemoveAdmin(adm.id!, adm.email)}
+                                disabled={submitting}
+                                className="text-xs font-bold text-red-650 hover:text-red-800 px-2 py-1 rounded-lg border border-red-100 hover:border-red-200 hover:bg-red-50 transition-all flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                              >
+                                <Trash2 className="w-3.5 h-3.5 text-red-600" />
+                                <span>{t.removeBtn}</span>
+                              </button>
+                            </div>
                           </div>
                         ))}
                       </div>
@@ -3257,62 +3362,61 @@ export default function AdminPage() {
             className="w-[794px] p-8 flex flex-col font-sans"
             style={{ minHeight: "1123px", backgroundColor: "#ffffff", color: "#1e293b", border: "1px solid #e5e7eb" }}
           >
-            {/* Header */}
-            <div className="p-6 rounded-t-xl text-center relative" style={{ backgroundColor: "#065f46", color: "#ffffff" }}>
-              <div style={{ position: "absolute", top: "16px", right: "16px", fontSize: "9px", color: "rgba(255, 255, 255, 0.8)", fontWeight: "bold" }}>
-                Download Date: {new Date().toLocaleDateString("en-US", { day: "numeric", month: "long", year: "numeric" })}
-              </div>
+            {/* Header (Green Background) */}
+            <div className="p-6 rounded-t-xl text-center" style={{ backgroundColor: "#065f46", color: "#ffffff" }}>
               <h1 className="text-2xl font-bold tracking-wide uppercase">Subedar Jame Masjid Al Khawari</h1>
-              <p className="text-xs mt-1 uppercase font-semibold" style={{ color: "#d1fae5" }}>Subedar Jame Masjid Al Khawari Management Committee</p>
-              <p className="text-xs mt-0.5 font-medium" style={{ color: "#a7f3d0" }}>South Mirer Khil, Hathazari, Chattogram, Bangladesh</p>
-              <h2 className="text-base font-extrabold tracking-widest mt-4 uppercase pt-3" style={{ color: "#d1fae5", borderTop: "1px solid rgba(4, 120, 87, 0.6)" }}>
-                OFFICIAL FINANCIAL STATEMENT REPORT
-              </h2>
+              <p className="text-xs mt-1 font-normal" style={{ color: "#a7f3d0" }}>South Mirer Khil, Hathazari, Chattogram, Bangladesh</p>
             </div>
 
             {/* Statement Body */}
             <div className="flex-grow p-6 flex flex-col space-y-6">
-              {/* Date Metadata */}
-              <div className="flex justify-between items-center text-xs font-semibold p-4 rounded-xl" style={{ color: "#64748b", backgroundColor: "#f8fafc" }}>
-                <span>REPORT PERIOD: <strong style={{ color: "#1e293b" }}>{repStartDate ? repStartDate : "Inception"} - {repEndDate ? repEndDate : new Date().toLocaleDateString("en-US")}</strong></span>
-                <span>Download Date: {new Date().toLocaleDateString("en-US", { day: "numeric", month: "long", year: "numeric" })}</span>
+              {/* Title Block */}
+              <div className="text-center mt-2">
+                <div className="py-3 rounded-lg font-extrabold tracking-widest text-base uppercase" style={{ backgroundColor: "#065f46", color: "#ffffff" }}>
+                  Financial Statement Report
+                </div>
               </div>
 
-              {/* Financial Position Cards */}
+              {/* Sub-header Row */}
+              <div className="flex justify-between items-center text-xs font-semibold p-4 rounded-xl" style={{ color: "#475569", backgroundColor: "#f8fafc", border: "1px solid #f1f5f9" }}>
+                <span>REPORT PERIOD: <strong style={{ color: "#0f172a" }}>{reportsFilter === "weekly" ? "Last 7 Days" : reportsFilter === "monthly" ? "Last 30 Days" : reportsFilter === "yearly" ? "Last 365 Days" : reportsFilter === "custom" ? `Custom: ${repStartDate || "Inception"} to ${repEndDate || "Present"}` : "All Time"}</strong></span>
+                <span>Download Date: <strong style={{ color: "#0f172a" }}>{(() => { const today = new Date(); const dd = String(today.getDate()).padStart(2, '0'); const mm = String(today.getMonth() + 1).padStart(2, '0'); const yyyy = today.getFullYear(); return `${dd}-${mm}-${yyyy}`; })()}</strong></span>
+              </div>
+
+              {/* Stat Boxes */}
               <div className="grid grid-cols-3 gap-4">
-                <div className="p-4 rounded-2xl text-center space-y-1" style={{ border: "1px solid #ccfbf1", backgroundColor: "rgba(240, 253, 250, 0.3)" }}>
-                  <span className="text-[10px] font-bold uppercase tracking-wider block" style={{ color: "#115e59" }}>Total Collections</span>
+                <div className="p-4 rounded-2xl text-center space-y-1.5" style={{ border: "1px solid #ccfbf1", backgroundColor: "rgba(240, 253, 250, 0.3)" }}>
+                  <span className="text-[10px] font-bold uppercase tracking-wider block" style={{ color: "#115e59" }}>Total Income</span>
                   <span className="text-base font-black block" style={{ color: "#0d9488" }}>৳{stats.totalIncome.toLocaleString()}.00</span>
                 </div>
-                <div className="p-4 rounded-2xl text-center space-y-1" style={{ border: "1px solid #fee2e2", backgroundColor: "rgba(254, 242, 242, 0.2)" }}>
-                  <span className="text-[10px] font-bold uppercase tracking-wider block" style={{ color: "#991b1b" }}>Total Expenditures</span>
+                <div className="p-4 rounded-2xl text-center space-y-1.5" style={{ border: "1px solid #fee2e2", backgroundColor: "rgba(254, 242, 242, 0.2)" }}>
+                  <span className="text-[10px] font-bold uppercase tracking-wider block" style={{ color: "#991b1b" }}>Total Expense</span>
                   <span className="text-base font-black block" style={{ color: "#dc2626" }}>৳{stats.totalExpenses.toLocaleString()}.00</span>
                 </div>
-                <div className="p-4 rounded-2xl text-center space-y-1 shadow-sm" style={{ backgroundColor: "#065f46", color: "#ffffff" }}>
-                  <span className="text-[10px] font-bold uppercase tracking-wider block" style={{ color: "#d1fae5" }}>Net Available Fund</span>
+                <div className="p-4 rounded-2xl text-center space-y-1.5" style={{ border: "1px solid #e2e8f0", backgroundColor: "#065f46", color: "#ffffff" }}>
+                  <span className="text-[10px] font-bold uppercase tracking-wider block" style={{ color: "#d1fae5" }}>Net Balance</span>
                   <span className="text-base font-black block">৳{stats.netBalance.toLocaleString()}.00</span>
                 </div>
               </div>
 
-              {/* Breakdown Grid */}
+              {/* Breakdown Tables (Collections & Expenditures) */}
               <div className="grid grid-cols-2 gap-6 pt-2">
                 {/* Income Breakdown */}
                 <div className="space-y-3">
-                  <h3 className="text-xs font-extrabold uppercase tracking-wider pb-1.5 flex items-center gap-1" style={{ color: "#1e293b", borderBottom: "1px solid #f1f5f9" }}>
-                    <span className="w-2 h-2 rounded-full inline-block" style={{ backgroundColor: "#14b8a6" }}></span>
-                    <span>Collections Category Breakdown</span>
-                  </h3>
-                  <table className="w-full text-left text-xs">
+                  <div className="py-2 px-3 rounded-lg text-xs font-extrabold uppercase tracking-wider text-center" style={{ backgroundColor: "#065f46", color: "#ffffff" }}>
+                    Collections Category Breakdown
+                  </div>
+                  <table className="w-full text-left text-xs" style={{ tableLayout: "fixed" }}>
                     <thead>
-                      <tr style={{ borderBottom: "1px solid #f1f5f9", color: "#94a3b8" }}>
-                        <th className="py-2 font-bold uppercase">Category Name</th>
-                        <th className="py-2 text-right font-bold uppercase">BDT Amount</th>
+                      <tr style={{ borderBottom: "1px solid #f1f5f9", color: "#64748b" }}>
+                        <th className="py-2 font-bold uppercase" style={{ width: "65%" }}>Category Name</th>
+                        <th className="py-2 text-right font-bold uppercase" style={{ width: "35%" }}>BDT Amount</th>
                       </tr>
                     </thead>
                     <tbody>
                       {Object.entries(stats.incomeByCategory).map(([cat, amt]) => (
                         <tr key={cat} style={{ borderBottom: "1px solid rgba(241, 245, 249, 0.5)" }}>
-                          <td className="py-2.5 font-medium" style={{ color: "#475569" }}>{translateCategory(cat, "en")}</td>
+                          <td className="py-2.5 font-medium truncate" style={{ color: "#475569" }}>{translateCategory(cat, "en")}</td>
                           <td className="py-2.5 text-right font-bold" style={{ color: "#1e293b" }}>৳{amt.toLocaleString()}</td>
                         </tr>
                       ))}
@@ -3327,21 +3431,20 @@ export default function AdminPage() {
 
                 {/* Expense Breakdown */}
                 <div className="space-y-3">
-                  <h3 className="text-xs font-extrabold uppercase tracking-wider pb-1.5 flex items-center gap-1" style={{ color: "#1e293b", borderBottom: "1px solid #f1f5f9" }}>
-                    <span className="w-2 h-2 rounded-full inline-block" style={{ backgroundColor: "#ef4444" }}></span>
-                    <span>Expenditures Category Breakdown</span>
-                  </h3>
-                  <table className="w-full text-left text-xs">
+                  <div className="py-2 px-3 rounded-lg text-xs font-extrabold uppercase tracking-wider text-center" style={{ backgroundColor: "#991b1b", color: "#ffffff" }}>
+                    Expenditures Category Breakdown
+                  </div>
+                  <table className="w-full text-left text-xs" style={{ tableLayout: "fixed" }}>
                     <thead>
-                      <tr style={{ borderBottom: "1px solid #f1f5f9", color: "#94a3b8" }}>
-                        <th className="py-2 font-bold uppercase">Expense Category</th>
-                        <th className="py-2 text-right font-bold uppercase">BDT Amount</th>
+                      <tr style={{ borderBottom: "1px solid #f1f5f9", color: "#64748b" }}>
+                        <th className="py-2 font-bold uppercase" style={{ width: "65%" }}>Expense Category</th>
+                        <th className="py-2 text-right font-bold uppercase" style={{ width: "35%" }}>BDT Amount</th>
                       </tr>
                     </thead>
                     <tbody>
                       {Object.entries(stats.expenseByCategory).map(([cat, amt]) => (
                         <tr key={cat} style={{ borderBottom: "1px solid rgba(241, 245, 249, 0.5)" }}>
-                          <td className="py-2.5 font-medium" style={{ color: "#475569" }}>{translateCategory(cat, "en")}</td>
+                          <td className="py-2.5 font-medium truncate" style={{ color: "#475569" }}>{translateCategory(cat, "en")}</td>
                           <td className="py-2.5 text-right font-bold" style={{ color: "#1e293b" }}>৳{amt.toLocaleString()}</td>
                         </tr>
                       ))}
@@ -3355,60 +3458,21 @@ export default function AdminPage() {
                 </div>
               </div>
 
-              {/* Approved Ledger List Table (Limit to 10 for layout spacing) */}
-              <div className="space-y-3 pt-2">
-                <h3 className="text-xs font-extrabold uppercase tracking-wider pb-1.5" style={{ color: "#1e293b", borderBottom: "1px solid #f1f5f9" }}>
-                  Recent Approved Ledger Transactions
-                </h3>
-                <table className="w-full text-left text-[11px] rounded-xl overflow-hidden shadow-sm" style={{ border: "1px solid #f1f5f9" }}>
-                  <thead>
-                    <tr style={{ backgroundColor: "#f8fafc", borderBottom: "1px solid #f1f5f9", color: "#64748b" }} className="uppercase font-bold">
-                      <th className="p-2.5">Date</th>
-                      <th className="p-2.5">Donor/Description</th>
-                      <th className="p-2.5">Category</th>
-                      <th className="p-2.5">Type</th>
-                      <th className="p-2.5 text-right">BDT Amount</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {filteredApprovedDonationsForReport.slice(0, 10).map((d) => (
-                      <tr key={d.id} style={{ borderBottom: "1px solid #f8fafc" }} className="font-medium">
-                        <td className="p-2.5" style={{ color: "#94a3b8" }}>{d.date.toLocaleDateString()}</td>
-                        <td className="p-2.5" style={{ color: "#334155" }}>{d.isAnonymous ? "Anonymous" : d.donorName || "Anonymous"}</td>
-                        <td className="p-2.5" style={{ color: "#64748b" }}>{translateCategory(d.category, "en")}</td>
-                        <td className="p-2.5 uppercase font-bold" style={{ color: "#0d9488" }}>INCOME</td>
-                        <td className="p-2.5 text-right font-bold" style={{ color: "#1e293b" }}>৳{d.amount.toLocaleString()}</td>
-                      </tr>
-                    ))}
-                    {filteredExpensesForReport.slice(0, 10).map((e) => (
-                      <tr key={e.id} style={{ borderBottom: "1px solid #f8fafc" }} className="font-medium">
-                        <td className="p-2.5" style={{ color: "#94a3b8" }}>{e.date.toLocaleDateString()}</td>
-                        <td className="p-2.5" style={{ color: "#334155" }}>{e.description}</td>
-                        <td className="p-2.5" style={{ color: "#64748b" }}>{translateCategory(e.category, "en")}</td>
-                        <td className="p-2.5 uppercase font-bold" style={{ color: "#dc2626" }}>EXPENSE</td>
-                        <td className="p-2.5 text-right font-bold" style={{ color: "#1e293b" }}>৳{e.amount.toLocaleString()}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-
-              {/* Digital Signatures from Settings */}
-              <div className="pt-10 grid grid-cols-2 gap-8 text-center text-xs font-semibold mt-auto" style={{ color: "#94a3b8" }}>
+              {/* Signatures */}
+              <div className="pt-10 grid grid-cols-2 gap-8 text-center text-xs font-semibold mt-auto" style={{ color: "#475569" }}>
                 <div className="flex flex-col items-center justify-end space-y-1">
                   {globalSettings?.treasurerSignatureUrl ? (
                     <img
                       src={globalSettings.treasurerSignatureUrl}
                       alt="Treasurer Signature"
-                      className="h-10 object-contain mb-1 select-none pointer-events-none"
+                      className="h-12 object-contain mb-1 select-none pointer-events-none"
                       crossOrigin="anonymous"
                     />
                   ) : (
-                    <div className="h-10 w-3/4 mb-1" style={{ borderBottom: "1px dashed #e2e8f0" }} />
+                    <div className="h-12 w-3/4 mb-1" style={{ borderBottom: "1px dashed #cbd5e1" }} />
                   )}
-                  <div className="w-full pt-1.5" style={{ borderTop: "1px solid #f1f5f9" }}>
-                    <span className="block font-bold" style={{ color: "#334155" }}>Masjid Treasurer Signature</span>
-                    <span className="block text-[9px] font-medium" style={{ color: "#94a3b8" }}>Subedar Jame Masjid Al Khawari</span>
+                  <div className="w-full pt-1.5" style={{ borderTop: "1px solid #e2e8f0" }}>
+                    <span className="block font-bold text-slate-800">Treasurer</span>
                   </div>
                 </div>
 
@@ -3417,24 +3481,22 @@ export default function AdminPage() {
                     <img
                       src={globalSettings.presidentSignatureUrl}
                       alt="President Signature"
-                      className="h-10 object-contain mb-1 select-none pointer-events-none"
+                      className="h-12 object-contain mb-1 select-none pointer-events-none"
                       crossOrigin="anonymous"
                     />
                   ) : (
-                    <div className="h-10 w-3/4 mb-1" style={{ borderBottom: "1px dashed #e2e8f0" }} />
+                    <div className="h-12 w-3/4 mb-1" style={{ borderBottom: "1px dashed #cbd5e1" }} />
                   )}
-                  <div className="w-full pt-1.5" style={{ borderTop: "1px solid #f1f5f9" }}>
-                    <span className="block font-bold" style={{ color: "#334155" }}>Mosque Committee President</span>
-                    <span className="block text-[9px] font-medium" style={{ color: "#94a3b8" }}>Subedar Jame Masjid Al Khawari</span>
+                  <div className="w-full pt-1.5" style={{ borderTop: "1px solid #e2e8f0" }}>
+                    <span className="block font-bold text-slate-800">President</span>
                   </div>
                 </div>
               </div>
             </div>
 
-            {/* Footer banner */}
-            <div className="p-4 rounded-b-xl text-center text-[10px] leading-normal" style={{ backgroundColor: "#f8fafc", borderTop: "1px solid #f1f5f9", color: "#94a3b8" }}>
-              <p className="font-semibold" style={{ color: "#64748b" }}>Thank you for your transparent cooperation. May Allah accept your contribution. JazakAllahu Khairan.</p>
-              <p className="text-[8px] mt-0.5" style={{ color: "#cbd5e1" }}>This financial statement is digitally verified and prepared directly under Subedar Jame Masjid Al Khawari Audit system.</p>
+            {/* Footer */}
+            <div className="p-4 rounded-b-xl text-center text-[10px] leading-relaxed" style={{ backgroundColor: "#f8fafc", borderTop: "1px solid #f1f5f9", color: "#475569" }}>
+              <p className="font-semibold">Subedar Jame Masjid Al Khawari Management Committee</p>
             </div>
           </div>
         </div>
@@ -3446,61 +3508,64 @@ export default function AdminPage() {
             className="w-[595px] p-8 flex flex-col font-sans"
             style={{ minHeight: "842px", backgroundColor: "#ffffff", color: "#1e293b", border: "1px solid #e5e7eb" }}
           >
-            {/* Header */}
-            <div className="p-5 rounded-t-xl text-center relative" style={{ backgroundColor: "#065f46", color: "#ffffff" }}>
-              <div style={{ position: "absolute", top: "12px", right: "16px", fontSize: "8px", color: "rgba(255, 255, 255, 0.8)", fontWeight: "bold" }}>
-                Download Date: {new Date().toLocaleDateString("en-US", { day: "numeric", month: "long", year: "numeric" })}
-              </div>
+            {/* Header (Green Background) */}
+            <div className="p-5 rounded-t-xl text-center" style={{ backgroundColor: "#065f46", color: "#ffffff" }}>
               <h1 className="text-xl font-bold tracking-wide uppercase">Subedar Jame Masjid Al Khawari</h1>
-              <p className="text-[10px] mt-1 uppercase font-semibold" style={{ color: "#d1fae5" }}>Subedar Jame Masjid Al Khawari Management Committee</p>
-              <p className="text-[10px] mt-0.5 font-medium" style={{ color: "#a7f3d0" }}>South Mirer Khil, Hathazari, Chattogram, Bangladesh</p>
+              <p className="text-[10px] mt-1 font-normal" style={{ color: "#a7f3d0" }}>South Mirer Khil, Hathazari, Chattogram, Bangladesh</p>
             </div>
 
             {/* Receipt Body */}
             <div className="flex-grow p-6 flex flex-col space-y-6">
+              {/* Title Block */}
               <div className="text-center mt-2">
-                <h2 className="text-base font-extrabold tracking-wider uppercase pb-2 inline-block px-4" style={{ color: "#1e293b", borderBottom: "2px solid #f1f5f9" }}>
+                <div className="py-2.5 rounded-lg font-extrabold tracking-wider text-sm uppercase" style={{ backgroundColor: "#065f46", color: "#ffffff" }}>
                   CASH RECEIPT
-                </h2>
+                </div>
               </div>
 
-              {/* Date and ID */}
-              <div className="flex justify-between items-center text-xs font-semibold p-3 rounded-lg" style={{ color: "#64748b", backgroundColor: "#f8fafc" }}>
-                <span>RECEIPT ID: <strong style={{ color: "#1e293b" }}>{pdfReceiptData ? pdfReceiptData.receiptId : ""}</strong></span>
-                <span>Download Date: {new Date().toLocaleDateString("en-US", { day: "numeric", month: "long", year: "numeric" })}</span>
+              {/* Sub-header Row */}
+              <div className="flex justify-between items-center text-xs font-semibold p-3 rounded-lg" style={{ color: "#475569", backgroundColor: "#f8fafc", border: "1px solid #f1f5f9" }}>
+                <span>Receipt ID: <strong style={{ color: "#0f172a" }}>{pdfReceiptData ? pdfReceiptData.receiptId : ""}</strong></span>
+                <span>Download Date: <strong style={{ color: "#0f172a" }}>{(() => { const today = new Date(); const dd = String(today.getDate()).padStart(2, '0'); const mm = String(today.getMonth() + 1).padStart(2, '0'); const yyyy = today.getFullYear(); return `${dd}-${mm}-${yyyy}`; })()}</strong></span>
               </div>
 
-              {/* Receipt Details Grid */}
+              {/* Grid/Table Details */}
               <div className="rounded-xl overflow-hidden shadow-sm" style={{ border: "1px solid #f1f5f9" }}>
-                <table className="w-full text-xs text-left">
+                <table className="w-full text-xs text-left" style={{ borderCollapse: "collapse" }}>
                   <tbody>
-                    <tr style={{ borderBottom: "1px solid #f8fafc", backgroundColor: "rgba(248, 250, 252, 0.2)" }}>
-                      <td className="p-3.5 font-bold uppercase w-1/3" style={{ color: "#94a3b8" }}>Donor Name:</td>
-                      <td className="p-3.5 font-medium" style={{ color: "#1e293b" }}>
+                    <tr style={{ borderBottom: "1px solid #f1f5f9", backgroundColor: "#f8fafc" }}>
+                      <td className="p-3.5 font-bold uppercase w-1/3" style={{ color: "#64748b" }}>Donor Name:</td>
+                      <td className="p-3.5 font-semibold" style={{ color: "#1e293b" }}>
                         {pdfReceiptData ? (pdfReceiptData.isAnonymous ? "Anonymous Donor (Nam Prokash e Onicchuk)" : pdfReceiptData.donorName || "Anonymous") : ""}
                       </td>
                     </tr>
-                    <tr style={{ borderBottom: "1px solid #f8fafc" }}>
-                      <td className="p-3.5 font-bold uppercase" style={{ color: "#94a3b8" }}>Donation Category:</td>
-                      <td className="p-3.5 font-medium" style={{ color: "#1e293b" }}>
+                    <tr style={{ borderBottom: "1px solid #f1f5f9" }}>
+                      <td className="p-3.5 font-bold uppercase" style={{ color: "#64748b" }}>Donation Category:</td>
+                      <td className="p-3.5 font-semibold" style={{ color: "#1e293b" }}>
                         {pdfReceiptData ? translateCategory(pdfReceiptData.category, "en") : ""}
                       </td>
                     </tr>
-                    <tr style={{ borderBottom: "1px solid #f8fafc", backgroundColor: "rgba(248, 250, 252, 0.2)" }}>
-                      <td className="p-3.5 font-bold uppercase" style={{ color: "#94a3b8" }}>Payment Method:</td>
-                      <td className="p-3.5 font-medium uppercase" style={{ color: "#1e293b" }}>
+                    <tr style={{ borderBottom: "1px solid #f1f5f9", backgroundColor: "#f8fafc" }}>
+                      <td className="p-3.5 font-bold uppercase" style={{ color: "#64748b" }}>Payment Method:</td>
+                      <td className="p-3.5 font-semibold uppercase" style={{ color: "#1e293b" }}>
                         {pdfReceiptData ? pdfReceiptData.paymentMethod.toUpperCase() : ""}
                       </td>
                     </tr>
-                    <tr style={{ borderBottom: "1px solid #f8fafc" }}>
-                      <td className="p-3.5 font-bold uppercase" style={{ color: "#94a3b8" }}>Transaction ID:</td>
-                      <td className="p-3.5 font-medium break-all font-mono" style={{ color: "#1e293b" }}>
+                    <tr style={{ borderBottom: "1px solid #f1f5f9" }}>
+                      <td className="p-3.5 font-bold uppercase" style={{ color: "#64748b" }}>Transaction ID:</td>
+                      <td className="p-3.5 font-mono font-semibold" style={{ color: "#1e293b" }}>
                         {pdfReceiptData ? (pdfReceiptData.trxId || "N/A (Cash Entry)") : ""}
                       </td>
                     </tr>
-                    <tr style={{ backgroundColor: "rgba(248, 250, 252, 0.2)" }}>
-                      <td className="p-3.5 font-bold uppercase" style={{ color: "#94a3b8" }}>Approval Date:</td>
-                      <td className="p-3.5 font-medium" style={{ color: "#1e293b" }}>
+                    <tr style={{ borderBottom: "1px solid #f1f5f9", backgroundColor: "#f8fafc" }}>
+                      <td className="p-3.5 font-bold uppercase" style={{ color: "#64748b" }}>Payment Date:</td>
+                      <td className="p-3.5 font-semibold" style={{ color: "#1e293b" }}>
+                        {pdfReceiptData ? pdfReceiptData.date.toLocaleDateString("en-US", { day: "numeric", month: "long", year: "numeric" }) : ""}
+                      </td>
+                    </tr>
+                    <tr style={{ borderBottom: "1px solid #f1f5f9" }}>
+                      <td className="p-3.5 font-bold uppercase" style={{ color: "#64748b" }}>Approval Date:</td>
+                      <td className="p-3.5 font-semibold" style={{ color: "#1e293b" }}>
                         {pdfReceiptData ? pdfReceiptData.date.toLocaleDateString("en-US", { day: "numeric", month: "long", year: "numeric" }) : ""}
                       </td>
                     </tr>
@@ -3508,38 +3573,37 @@ export default function AdminPage() {
                 </table>
               </div>
 
-              {/* Amount Display */}
-              <div className="rounded-xl p-4 flex justify-between items-center" style={{ backgroundColor: "rgba(240, 253, 250, 0.6)", border: "1px solid #ccfbf1" }}>
-                <span className="text-xs font-bold uppercase" style={{ color: "#115e59" }}>Total Amount Received:</span>
-                <span className="text-base font-extrabold" style={{ color: "#0d9488" }}>
+              {/* Total Amount Box */}
+              <div className="rounded-xl p-4 text-center space-y-1.5" style={{ backgroundColor: "#f0fdfa", border: "2px solid #55b699", color: "#115e59" }}>
+                <span className="text-[11px] font-bold uppercase tracking-wider block">Total Donation Amount</span>
+                <span className="text-xl font-extrabold block">
                   ৳{pdfReceiptData ? pdfReceiptData.amount.toLocaleString() : "0"}.00
                 </span>
               </div>
 
-              {/* Verification Seal */}
+              {/* Verification */}
               <div className="flex justify-center mt-2">
                 <div className="px-5 py-1.5 rounded-full text-[10px] font-extrabold tracking-widest uppercase flex items-center gap-1.5 shadow-sm" style={{ backgroundColor: "#ecfdf5", border: "1px solid #a7f3d0", color: "#047857" }}>
                   <CheckCircle2 className="w-3.5 h-3.5" style={{ color: "#059669" }} />
-                  <span>Verified & Cash Received</span>
+                  <span>Verified & Received</span>
                 </div>
               </div>
 
-              {/* Digital Signatures from Settings */}
-              <div className="pt-8 grid grid-cols-2 gap-8 text-center text-[10px] font-semibold mt-auto" style={{ color: "#94a3b8" }}>
+              {/* Signatures */}
+              <div className="pt-8 grid grid-cols-2 gap-8 text-center text-[10px] font-semibold mt-auto" style={{ color: "#475569" }}>
                 <div className="flex flex-col items-center justify-end space-y-1">
                   {globalSettings?.treasurerSignatureUrl ? (
                     <img
                       src={globalSettings.treasurerSignatureUrl}
                       alt="Treasurer Signature"
-                      className="h-10 object-contain mb-1 select-none pointer-events-none"
+                      className="h-12 object-contain mb-1 select-none pointer-events-none"
                       crossOrigin="anonymous"
                     />
                   ) : (
-                    <div className="h-10 w-3/4 mb-1" style={{ borderBottom: "1px dashed #e2e8f0" }} />
+                    <div className="h-12 w-3/4 mb-1" style={{ borderBottom: "1px dashed #cbd5e1" }} />
                   )}
-                  <div className="w-full pt-1.5" style={{ borderTop: "1px solid #f1f5f9" }}>
-                    <span className="block font-bold" style={{ color: "#334155" }}>Masjid Treasurer</span>
-                    <span className="block text-[8px] font-medium" style={{ color: "#94a3b8" }}>Subedar Jame Masjid Al Khawari</span>
+                  <div className="w-full pt-1.5" style={{ borderTop: "1px solid #e2e8f0" }}>
+                    <span className="block font-bold text-slate-800">Treasurer</span>
                   </div>
                 </div>
 
@@ -3548,24 +3612,23 @@ export default function AdminPage() {
                     <img
                       src={globalSettings.presidentSignatureUrl}
                       alt="President Signature"
-                      className="h-10 object-contain mb-1 select-none pointer-events-none"
+                      className="h-12 object-contain mb-1 select-none pointer-events-none"
                       crossOrigin="anonymous"
                     />
                   ) : (
-                    <div className="h-10 w-3/4 mb-1" style={{ borderBottom: "1px dashed #e2e8f0" }} />
+                    <div className="h-12 w-3/4 mb-1" style={{ borderBottom: "1px dashed #cbd5e1" }} />
                   )}
-                  <div className="w-full pt-1.5" style={{ borderTop: "1px solid #f1f5f9" }}>
-                    <span className="block font-bold" style={{ color: "#334155" }}>Mosque Committee President</span>
-                    <span className="block text-[8px] font-medium" style={{ color: "#94a3b8" }}>Subedar Jame Masjid Al Khawari</span>
+                  <div className="w-full pt-1.5" style={{ borderTop: "1px solid #e2e8f0" }}>
+                    <span className="block font-bold text-slate-800">President</span>
                   </div>
                 </div>
               </div>
             </div>
 
-            {/* Footer banner */}
-            <div className="p-4 rounded-b-xl text-center text-[8px] leading-normal" style={{ backgroundColor: "#f8fafc", borderTop: "1px solid #f1f5f9", color: "#94a3b8" }}>
-              <p className="font-semibold" style={{ color: "#64748b" }}>Thank you for your generous contribution. May Allah accept your donation.</p>
-              <p className="text-[7px] mt-0.5" style={{ color: "#cbd5e1" }}>This is a digitally verified financial receipt generated under Subedar Jame Masjid Al Khawari Al Audit system.</p>
+            {/* Footer */}
+            <div className="p-4 rounded-b-xl text-center text-[9px] leading-relaxed" style={{ backgroundColor: "#f8fafc", borderTop: "1px solid #f1f5f9", color: "#64748b" }}>
+              <p className="font-semibold">Thank you for your donation. Jazakallah Khairan.</p>
+              <p className="text-[9px] mt-0.5" style={{ color: "#475569" }}>Subedar Jame Masjid Al Khawari Management Committee</p>
             </div>
           </div>
         </div>

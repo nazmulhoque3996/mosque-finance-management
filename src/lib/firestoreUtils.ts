@@ -13,8 +13,7 @@ import {
   DocumentData,
   QueryDocumentSnapshot,
 } from "firebase/firestore";
-import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
-import { db, storage } from "./firebase";
+import { db } from "./firebase";
 
 // ==========================================
 // 1. TypeScript Interfaces & Data Models
@@ -211,29 +210,29 @@ export async function getAuditLogs(): Promise<AuditLog[]> {
 }
 
 // ==========================================
-// 5. Firebase Storage Utilities
+// 5. Client-Side Image to Base64 Converter
 // ==========================================
 
 /**
- * Uploads a voucher image directly to Firebase Storage and returns the downloadURL.
- * Wraps uploadBytes inside a robust 12-second timeout to prevent UI hangs.
+ * Converts a selected voucher/signature image directly into a Base64 data URL.
+ * Strictly checks file size (< 500KB) to ensure Firestore's 1MB document quota is respected.
  */
-export async function uploadVoucherImage(file: File): Promise<string> {
-  try {
-    const fileRef = ref(storage, `vouchers/${Date.now()}_${file.name}`);
-    
-    const uploadPromise = uploadBytes(fileRef, file);
-    const timeoutPromise = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error("Firebase Storage Upload Timeout (12s limit reached)")), 12000)
-    );
-
-    const snapshot = await Promise.race([uploadPromise, timeoutPromise]);
-    const downloadUrl = await getDownloadURL(snapshot.ref);
-    return downloadUrl;
-  } catch (error) {
-    console.error("Firebase Storage upload failed or timed out:", error);
-    throw error;
+export function convertFileToBase64(file: File): Promise<string> {
+  if (file.size >= 500 * 1024) {
+    return Promise.reject(new Error("File size must be less than 500KB."));
   }
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.readAsDataURL(file);
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        resolve(reader.result);
+      } else {
+        reject(new Error("Failed to convert file to Base64 string."));
+      }
+    };
+    reader.onerror = (error) => reject(error);
+  });
 }
 
 // ==========================================
