@@ -72,6 +72,7 @@ import {
   BarChart3,
   Loader2,
   Check,
+  Mail,
   X,
   PlusCircle,
   Trash2,
@@ -483,9 +484,6 @@ export default function AdminPage() {
 
   // --- Lightbox & Custom Admin Password Modals ---
   const [previewVoucherUrl, setPreviewVoucherUrl] = useState<string | null>(null);
-  const [passwordResetTarget, setPasswordResetTarget] = useState<UserProfile | null>(null);
-  const [newPasswordVal, setNewPasswordVal] = useState("");
-  const [settingNewPassword, setSettingNewPassword] = useState(false);
 
   // --- Reporting PDF state ---
   const [downloadingPdf, setDownloadingPdf] = useState(false);
@@ -1238,7 +1236,7 @@ export default function AdminPage() {
         });
       }
 
-      triggerToast("success", t.saveSuccess, lang === "bn" ? "অ্যাডমিন অপসারণ করা হয়েছে।" : "Admin removed successfully.");
+      triggerToast("success", lang === "bn" ? "অ্যাডমিন প্রবেশাধিকার প্রত্যাহার করা হয়েছে" : "Administrator Access Revoked", lang === "bn" ? "অ্যাডমিন অপসারণ করা হয়েছে।" : "Admin removed successfully.");
       await loadAdminData();
     } catch (err) {
       triggerToast("error", t.saveError, t.saveError);
@@ -1269,7 +1267,7 @@ export default function AdminPage() {
         });
       }
 
-      triggerToast("success", t.saveSuccess, lang === "bn" ? "অ্যাডমিনের ভূমিকা সফলভাবে পরিবর্তন করা হয়েছে।" : "Admin role changed successfully.");
+      triggerToast("success", lang === "bn" ? "ভূমিকা সফলভাবে পরিবর্তন করা হয়েছে" : "Role Updated Successfully", lang === "bn" ? "অ্যাডমিনের ভূমিকা সফলভাবে পরিবর্তন করা হয়েছে।" : "Admin role changed successfully.");
       await loadAdminData();
     } catch (err: any) {
       triggerToast("error", t.saveError, err.message || t.saveError);
@@ -1278,80 +1276,34 @@ export default function AdminPage() {
     }
   };
 
-  // --- SuperAdmin: Set New Password via Secondary App ---
-  const handleSetNewPasswordSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!passwordResetTarget) return;
-
-    const targetEmail = passwordResetTarget.email.toLowerCase();
-    const targetPassword = newPasswordVal;
-
-    if (!targetPassword || targetPassword.length < 6) {
-      triggerToast("error", t.saveError, lang === "bn" ? "পাসওয়ার্ড অবশ্যই কমপক্ষে ৬ অক্ষরের হতে হবে।" : "Password must be at least 6 characters.");
+  // --- SuperAdmin: Send Password Reset Email ---
+  const handleSendPasswordResetEmail = async (adm: UserProfile) => {
+    const targetEmail = adm.email.toLowerCase();
+    
+    if (!window.confirm(lang === "bn" ? `আপনি কি ${targetEmail} অ্যাডমিনের পাসওয়ার্ড রিসেট ইমেইল পাঠাতে চান?` : `Are you sure you want to send a secure password reset email to ${targetEmail}?`)) {
       return;
     }
 
-    let secondaryAppInstance: any = null;
     try {
-      setSettingNewPassword(true);
-
-      const secondaryAppName = `SecondaryAppSet_${Date.now()}`;
-      const { initializeApp: initSecApp, deleteApp: delSecApp } = await import("firebase/app");
-      const { getAuth: getSecAuth, signInWithEmailAndPassword: loginSecUser, updatePassword: updateSecPassword, signOut: secSignOut } = await import("firebase/auth");
-
-      secondaryAppInstance = initSecApp(firebaseConfig, secondaryAppName);
-      const secondaryAuth = getSecAuth(secondaryAppInstance);
-
-      // Attempt to authenticate as the target user. 
-      // First try the password stored in Firestore. If none, fall back to "masjid123"
-      const currentStoredPassword = passwordResetTarget.password || "masjid123";
-
-      try {
-        await loginSecUser(secondaryAuth, targetEmail, currentStoredPassword);
-      } catch (authErr: any) {
-        // If login with stored password fails and it wasn't masjid123, try masjid123 as fallback
-        if (currentStoredPassword !== "masjid123") {
-          await loginSecUser(secondaryAuth, targetEmail, "masjid123");
-        } else {
-          throw authErr;
-        }
-      }
-
-      if (secondaryAuth.currentUser) {
-        // Direct password force-update
-        await updateSecPassword(secondaryAuth.currentUser, targetPassword);
-        await secSignOut(secondaryAuth);
-      }
-
-      // Update Firestore document with the new password
-      await setUserProfile(targetEmail, passwordResetTarget.role, targetPassword);
-
+      setSubmitting(true);
+      await sendPasswordResetEmail(auth, targetEmail);
+      
       // Audit Logging
       if (adminProfile) {
         await addAuditLog({
           adminEmail: adminProfile.email,
           actionType: "update",
           collectionName: "notices" as any,
-          details: `Directly updated password for admin: ${targetEmail}`
+          details: `Sent password reset email for admin: ${targetEmail}`
         });
       }
 
-      triggerToast("success", lang === "bn" ? "পাসওয়ার্ড সফলভাবে সেট হয়েছে!" : "Password Set Successfully", lang === "bn" ? "অ্যাডমিন পাসওয়ার্ড সফলভাবে আপডেট করা হয়েছে।" : "Admin password directly updated successfully.");
-      setPasswordResetTarget(null);
-      setNewPasswordVal("");
+      triggerToast("success", lang === "bn" ? "রিসেট লিংক প্রেরিত হয়েছে" : "Reset Link Sent Successfully", lang === "bn" ? `${targetEmail} অ্যাডমিনকে পাসওয়ার্ড রিসেট ইমেইল পাঠানো হয়েছে।` : `A secure password reset email has been sent to ${targetEmail}.`);
     } catch (err: any) {
-      console.error("Error setting user password directly:", err);
-      triggerToast("error", t.saveError, err.message || (lang === "bn" ? "পাসওয়ার্ড সেট করতে ব্যর্থ হয়েছে।" : "Failed to set user password. Verify auth credentials."));
+      console.error("Error sending reset email:", err);
+      triggerToast("error", t.saveError, err.message || (lang === "bn" ? "পাসওয়ার্ড রিসেট লিংক পাঠাতে ব্যর্থ হয়েছে।" : "Failed to send reset email."));
     } finally {
-      if (secondaryAppInstance) {
-        const { deleteApp: delSecApp } = await import("firebase/app");
-        try {
-          await delSecApp(secondaryAppInstance);
-        } catch (e) {
-          console.error("Error deleting secondary app:", e);
-        }
-      }
-      setSettingNewPassword(false);
+      setSubmitting(false);
     }
   };
 
@@ -3025,18 +2977,15 @@ export default function AdminPage() {
                                 <span>{lang === "bn" ? "ভূমিকা পরিবর্তন" : "Change Role"}</span>
                               </button>
 
-                               {/* Set New Password Button */}
+                               {/* Send Password Reset Email Button */}
                                <button
-                                 onClick={() => {
-                                   setPasswordResetTarget(adm);
-                                   setNewPasswordVal("");
-                                 }}
+                                 onClick={() => handleSendPasswordResetEmail(adm)}
                                  disabled={submitting}
                                  className="text-xs font-bold text-slate-600 hover:text-sky-750 px-2 py-1 rounded-lg border border-slate-200 hover:border-sky-200 hover:bg-sky-50 transition-all flex items-center gap-1 cursor-pointer disabled:opacity-50"
-                                 title={lang === "bn" ? "নতুন পাসওয়ার্ড সেট করুন" : "Set New Password"}
+                                 title={lang === "bn" ? "পাসওয়ার্ড রিসেট লিংক পাঠান" : "Send Password Reset Email"}
                                 >
-                                 <Lock className="w-3.5 h-3.5 text-sky-700" />
-                                 <span>{lang === "bn" ? "পাসওয়ার্ড পরিবর্তন" : "Set New Password"}</span>
+                                 <Mail className="w-3.5 h-3.5 text-sky-700" />
+                                 <span>{lang === "bn" ? "পাসওয়ার্ড রিসেট লিংক" : "Send Reset Email"}</span>
                                </button>
                               
                               {/* Delete Button */}
@@ -3489,57 +3438,7 @@ export default function AdminPage() {
         </div>
       )}
 
-      {/* ========================================================
-          MODAL: SUPERADMIN FORCE SET NEW PASSWORD
-          ======================================================== */}
-      {passwordResetTarget && (
-        <div className="fixed inset-0 bg-slate-900/60 z-50 flex items-center justify-center p-4 backdrop-blur-sm animate-fadeIn">
-          <div className="bg-white rounded-3xl p-6 w-full max-w-md shadow-2xl border border-gray-100 relative">
-            <button
-              onClick={() => setPasswordResetTarget(null)}
-              className="absolute right-4 top-4 text-slate-400 hover:text-slate-650 p-1 cursor-pointer"
-            >
-              <X className="w-5 h-5" />
-            </button>
 
-            <h3 className="text-base font-extrabold text-slate-900 border-b border-gray-150 pb-3 mb-4 flex items-center gap-1.5">
-              <Lock className="w-5 h-5 text-emerald-600" />
-              <span>{lang === "bn" ? "নতুন পাসওয়ার্ড সেট করুন" : "Set New Password"}</span>
-            </h3>
-
-            <form onSubmit={handleSetNewPasswordSubmit} className="space-y-4">
-              <div className="space-y-1.5">
-                <span className="text-[10px] text-slate-400 font-bold block uppercase tracking-wide">Target Administrator:</span>
-                <p className="text-xs font-bold text-slate-900 bg-gray-50 p-2.5 rounded-lg border border-gray-150 truncate">
-                  {passwordResetTarget.email}
-                </p>
-              </div>
-
-              <div className="space-y-1.5">
-                <label className="text-xs font-bold text-slate-700 uppercase">New Password</label>
-                <input
-                  type="password"
-                  value={newPasswordVal}
-                  onChange={(e) => setNewPasswordVal(e.target.value)}
-                  placeholder={lang === "bn" ? "কমপক্ষে ৬ সংখ্যার নতুন পাসওয়ার্ড" : "At least 6 characters"}
-                  className="w-full h-11 px-3 rounded-xl border border-gray-200 focus:ring-2 focus:ring-emerald-500 font-normal text-sm"
-                  minLength={6}
-                  required
-                />
-              </div>
-
-              <button
-                type="submit"
-                disabled={settingNewPassword}
-                className="w-full h-11 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-sm shadow-md transition-all active:scale-[0.98] disabled:opacity-50 flex items-center justify-center gap-1.5 cursor-pointer"
-              >
-                {settingNewPassword ? <Loader2 className="w-5 h-5 animate-spin" /> : <Check className="w-4 h-4" />}
-                <span>{settingNewPassword ? (lang === "bn" ? "সেট হচ্ছে..." : "Setting Password...") : (lang === "bn" ? "পাসওয়ার্ড আপডেট করুন" : "Update Password")}</span>
-              </button>
-            </form>
-          </div>
-        </div>
-      )}
 
         {/* Hidden A4 HTML template for high-fidelity PDF Financial Statement generation */}
         <div style={{ position: "absolute", left: "-9999px", top: "-9999px" }}>
@@ -3657,7 +3556,7 @@ export default function AdminPage() {
                     <div className="h-12 w-3/4 mb-1" style={{ borderBottom: "1px dashed #cbd5e1" }} />
                   )}
                   <div className="w-full pt-1.5" style={{ borderTop: "1px solid #e2e8f0" }}>
-                    <span className="block font-bold text-slate-800">Treasurer</span>
+                    <span className="block font-bold" style={{ color: "#1e293b" }}>Treasurer</span>
                   </div>
                 </div>
 
@@ -3672,7 +3571,7 @@ export default function AdminPage() {
                     <div className="h-12 w-3/4 mb-1" style={{ borderBottom: "1px dashed #cbd5e1" }} />
                   )}
                   <div className="w-full pt-1.5" style={{ borderTop: "1px solid #e2e8f0" }}>
-                    <span className="block font-bold text-slate-800">President</span>
+                    <span className="block font-bold" style={{ color: "#1e293b" }}>President</span>
                   </div>
                 </div>
               </div>
@@ -3714,7 +3613,7 @@ export default function AdminPage() {
               </div>
 
               {/* Grid/Table Details */}
-              <div className="rounded-xl overflow-hidden shadow-sm" style={{ border: "1px solid #f1f5f9" }}>
+              <div className="rounded-xl overflow-hidden" style={{ border: "1px solid #f1f5f9" }}>
                 <table className="w-full text-xs text-left" style={{ borderCollapse: "collapse" }}>
                   <tbody>
                     <tr style={{ borderBottom: "1px solid #f1f5f9", backgroundColor: "#f8fafc" }}>
@@ -3767,7 +3666,7 @@ export default function AdminPage() {
 
               {/* Verification */}
               <div className="flex justify-center mt-2">
-                <div className="px-5 py-1.5 rounded-full text-[10px] font-extrabold tracking-widest uppercase flex items-center gap-1.5 shadow-sm" style={{ backgroundColor: "#ecfdf5", border: "1px solid #a7f3d0", color: "#047857" }}>
+                <div className="px-5 py-1.5 rounded-full text-[10px] font-extrabold tracking-widest uppercase flex items-center gap-1.5" style={{ backgroundColor: "#ecfdf5", border: "1px solid #a7f3d0", color: "#047857" }}>
                   <CheckCircle2 className="w-3.5 h-3.5" style={{ color: "#059669" }} />
                   <span>Verified & Received</span>
                 </div>
@@ -3786,7 +3685,7 @@ export default function AdminPage() {
                     <div className="h-12 w-3/4 mb-1" style={{ borderBottom: "1px dashed #cbd5e1" }} />
                   )}
                   <div className="w-full pt-1.5" style={{ borderTop: "1px solid #e2e8f0" }}>
-                    <span className="block font-bold text-slate-800">Treasurer</span>
+                    <span className="block font-bold" style={{ color: "#1e293b" }}>Treasurer</span>
                   </div>
                 </div>
 
@@ -3801,7 +3700,7 @@ export default function AdminPage() {
                     <div className="h-12 w-3/4 mb-1" style={{ borderBottom: "1px dashed #cbd5e1" }} />
                   )}
                   <div className="w-full pt-1.5" style={{ borderTop: "1px solid #e2e8f0" }}>
-                    <span className="block font-bold text-slate-800">President</span>
+                    <span className="block font-bold" style={{ color: "#1e293b" }}>President</span>
                   </div>
                 </div>
               </div>
