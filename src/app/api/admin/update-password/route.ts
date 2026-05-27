@@ -1,55 +1,59 @@
-import { NextRequest, NextResponse } from "next/server";
-import * as admin from "firebase-admin";
+import { NextResponse } from 'next/server';
+import * as admin from 'firebase-admin';
 
-if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert({
-      projectId: process.env.FIREBASE_PROJECT_ID,
-      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-    }),
-  });
+export const dynamic = 'force-dynamic';
+
+function getAdminApp() {
+  if (!admin.apps.length) {
+    const projectId = process.env.FIREBASE_PROJECT_ID;
+    const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+    const privateKey = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n');
+
+    if (!projectId || !clientEmail || !privateKey) {
+      throw new Error("Missing Firebase Admin SDK environment configuration variables.");
+    }
+
+    admin.initializeApp({
+      credential: admin.credential.cert({
+        projectId,
+        clientEmail,
+        privateKey,
+      }),
+    });
+  }
+  return admin;
 }
 
-export async function POST(req: NextRequest) {
+export async function POST(req: Request) {
   try {
     const body = await req.json();
-    const { uid, email, newPassword } = body;
+    const { uid, newPassword } = body;
 
-    if (!newPassword || newPassword.length < 6) {
-      return NextResponse.json(
-        { error: "Password must be at least 6 characters long." },
-        { status: 400 }
-      );
+    if (!uid || !newPassword) {
+      return NextResponse.json({ error: 'Missing uid or newPassword' }, { status: 400 });
     }
+
+    if (newPassword.length < 6) {
+      return NextResponse.json({ error: 'Password must be at least 6 characters long' }, { status: 400 });
+    }
+
+    const firebaseAdmin = getAdminApp();
 
     let targetUid = uid;
-
-    // Look up UID by email if UID was not explicitly passed or is passed as email
-    if (!targetUid && email) {
-      const userRecord = await admin.auth().getUserByEmail(email);
-      targetUid = userRecord.uid;
-    } else if (targetUid && targetUid.includes("@")) {
-      const userRecord = await admin.auth().getUserByEmail(targetUid);
-      targetUid = userRecord.uid;
+    // If the provided uid is an email address, resolve the actual Auth UID first
+    if (uid.includes('@')) {
+      try {
+        const userRecord = await firebaseAdmin.auth().getUserByEmail(uid);
+        targetUid = userRecord.uid;
+      } catch (err: any) {
+        return NextResponse.json({ error: `User with email ${uid} not found: ${err.message}` }, { status: 404 });
+      }
     }
 
-    if (!targetUid) {
-      return NextResponse.json(
-        { error: "A valid UID or email is required to identify the target admin." },
-        { status: 400 }
-      );
-    }
-
-    // Force update the Auth password using Firebase Admin SDK
-    await admin.auth().updateUser(targetUid, { password: newPassword });
-
-    return NextResponse.json({ success: true });
-  } catch (err: any) {
-    console.error("Error updating user password via Firebase Admin:", err);
-    return NextResponse.json(
-      { error: err.message || "Failed to update target administrator password." },
-      { status: 500 }
-    );
+    await firebaseAdmin.auth().updateUser(targetUid, { password: newPassword });
+    return NextResponse.json({ message: 'Password updated successfully' }, { status: 200 });
+  } catch (error: any) {
+    console.error("Error force-updating password via admin SDK:", error);
+    return NextResponse.json({ error: error.message || 'Internal Error' }, { status: 500 });
   }
 }

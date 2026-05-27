@@ -1302,14 +1302,23 @@ export default function AdminPage() {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          email: targetEmail,
+          uid: targetEmail,
           newPassword: targetPassword,
         }),
       });
 
-      const resData = await response.json();
+      let resData: any = {};
+      const contentType = response.headers.get("content-type");
+      if (contentType && contentType.includes("application/json")) {
+        resData = await response.json();
+      } else {
+        const errorText = await response.text();
+        console.error("Non-JSON API error response:", errorText);
+        throw new Error(lang === "bn" ? "সার্ভার ত্রুটি ঘটেছে (নন-জেসন রেসপন্স)।" : "Server returned an unexpected non-JSON response.");
+      }
+
       if (!response.ok) {
-        throw new Error(resData.error || "Failed to forcefully update password.");
+        throw new Error(resData.error || (lang === "bn" ? "পাসওয়ার্ড সেট করতে ব্যর্থ হয়েছে।" : "Failed to forcefully update password."));
       }
 
       // Update stored password directly in Firestore user profile too for login consistency
