@@ -484,6 +484,9 @@ export default function AdminPage() {
 
   // --- Lightbox & Custom Admin Password Modals ---
   const [previewVoucherUrl, setPreviewVoucherUrl] = useState<string | null>(null);
+  const [passwordResetTarget, setPasswordResetTarget] = useState<UserProfile | null>(null);
+  const [newPasswordVal, setNewPasswordVal] = useState("");
+  const [settingNewPassword, setSettingNewPassword] = useState(false);
 
   // --- Reporting PDF state ---
   const [downloadingPdf, setDownloadingPdf] = useState(false);
@@ -1046,7 +1049,7 @@ export default function AdminPage() {
       setNewAdminEmail("");
       setNewAdminPassword("");
       
-      triggerToast("success", t.saveSuccess, lang === "bn" ? "অ্যাডমিন অ্যাকাউন্ট সফলভাবে তৈরি হয়েছে!" : "Admin account successfully created!");
+      triggerToast("success", lang === "bn" ? "অ্যাডমিন অ্যাকাউন্ট সফলভাবে তৈরি হয়েছে!" : "Admin account successfully created!", lang === "bn" ? "অ্যাডমিন অ্যাকাউন্ট সফলভাবে তৈরি হয়েছে!" : "Admin account successfully created!");
     } catch (err: any) {
       console.error("Error creating secondary auth user:", err);
       triggerToast("error", t.saveError, err.message || t.saveError);
@@ -1276,34 +1279,60 @@ export default function AdminPage() {
     }
   };
 
-  // --- SuperAdmin: Send Password Reset Email ---
-  const handleSendPasswordResetEmail = async (adm: UserProfile) => {
-    const targetEmail = adm.email.toLowerCase();
-    
-    if (!window.confirm(lang === "bn" ? `আপনি কি ${targetEmail} অ্যাডমিনের পাসওয়ার্ড রিসেট ইমেইল পাঠাতে চান?` : `Are you sure you want to send a secure password reset email to ${targetEmail}?`)) {
+  // --- SuperAdmin: Set New Password via Admin API Route ---
+  const handleSetNewPasswordSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!passwordResetTarget) return;
+
+    const targetEmail = passwordResetTarget.email.toLowerCase();
+    const targetPassword = newPasswordVal;
+
+    if (!targetPassword || targetPassword.length < 6) {
+      triggerToast("error", t.saveError, lang === "bn" ? "পাসওয়ার্ড অবশ্যই কমপক্ষে ৬ অক্ষরের হতে হবে।" : "Password must be at least 6 characters.");
       return;
     }
 
     try {
-      setSubmitting(true);
-      await sendPasswordResetEmail(auth, targetEmail);
-      
+      setSettingNewPassword(true);
+
+      // Fetch to Next.js API route to update Auth password forcefully
+      const response = await fetch("/api/admin/update-password", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          email: targetEmail,
+          newPassword: targetPassword,
+        }),
+      });
+
+      const resData = await response.json();
+      if (!response.ok) {
+        throw new Error(resData.error || "Failed to forcefully update password.");
+      }
+
+      // Update stored password directly in Firestore user profile too for login consistency
+      await setUserProfile(targetEmail, passwordResetTarget.role, targetPassword);
+
       // Audit Logging
       if (adminProfile) {
         await addAuditLog({
           adminEmail: adminProfile.email,
           actionType: "update",
           collectionName: "notices" as any,
-          details: `Sent password reset email for admin: ${targetEmail}`
+          details: `Force-updated password directly for admin: ${targetEmail} via server API`
         });
       }
 
-      triggerToast("success", lang === "bn" ? "রিসেট লিংক প্রেরিত হয়েছে" : "Reset Link Sent Successfully", lang === "bn" ? `${targetEmail} অ্যাডমিনকে পাসওয়ার্ড রিসেট ইমেইল পাঠানো হয়েছে।` : `A secure password reset email has been sent to ${targetEmail}.`);
+      triggerToast("success", lang === "bn" ? "পাসওয়ার্ড সফলভাবে সেট হয়েছে!" : "Password Set Successfully", lang === "bn" ? "অ্যাডমিন পাসওয়ার্ড সফলভাবে সরাসরি সেট করা হয়েছে।" : "Admin password directly force-updated successfully.");
+      setPasswordResetTarget(null);
+      setNewPasswordVal("");
     } catch (err: any) {
-      console.error("Error sending reset email:", err);
-      triggerToast("error", t.saveError, err.message || (lang === "bn" ? "পাসওয়ার্ড রিসেট লিংক পাঠাতে ব্যর্থ হয়েছে।" : "Failed to send reset email."));
+      console.error("Error force setting user password directly:", err);
+      triggerToast("error", t.saveError, err.message || (lang === "bn" ? "পাসওয়ার্ড সেট করতে ব্যর্থ হয়েছে।" : "Failed to set user password."));
     } finally {
-      setSubmitting(false);
+      setSettingNewPassword(false);
     }
   };
 
@@ -2977,15 +3006,18 @@ export default function AdminPage() {
                                 <span>{lang === "bn" ? "ভূমিকা পরিবর্তন" : "Change Role"}</span>
                               </button>
 
-                               {/* Send Password Reset Email Button */}
+                               {/* Set New Password Button */}
                                <button
-                                 onClick={() => handleSendPasswordResetEmail(adm)}
+                                 onClick={() => {
+                                   setPasswordResetTarget(adm);
+                                   setNewPasswordVal("");
+                                 }}
                                  disabled={submitting}
                                  className="text-xs font-bold text-slate-600 hover:text-sky-750 px-2 py-1 rounded-lg border border-slate-200 hover:border-sky-200 hover:bg-sky-50 transition-all flex items-center gap-1 cursor-pointer disabled:opacity-50"
-                                 title={lang === "bn" ? "পাসওয়ার্ড রিসেট লিংক পাঠান" : "Send Password Reset Email"}
+                                 title={lang === "bn" ? "নতুন পাসওয়ার্ড সেট করুন" : "Set New Password"}
                                 >
-                                 <Mail className="w-3.5 h-3.5 text-sky-700" />
-                                 <span>{lang === "bn" ? "পাসওয়ার্ড রিসেট লিংক" : "Send Reset Email"}</span>
+                                 <Lock className="w-3.5 h-3.5 text-sky-700" />
+                                 <span>{lang === "bn" ? "পাসওয়ার্ড পরিবর্তন" : "Set New Password"}</span>
                                </button>
                               
                               {/* Delete Button */}
@@ -3434,6 +3466,58 @@ export default function AdminPage() {
                 {lang === "bn" ? "বন্ধ করুন" : "Close Viewer"}
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================
+          MODAL: SUPERADMIN FORCE SET NEW PASSWORD
+          ======================================================== */}
+      {passwordResetTarget && (
+        <div className="fixed inset-0 bg-slate-900/60 z-50 flex items-center justify-center p-4 backdrop-blur-sm animate-fadeIn">
+          <div className="bg-white rounded-3xl p-6 w-full max-w-md shadow-2xl border border-gray-100 relative">
+            <button
+              onClick={() => setPasswordResetTarget(null)}
+              className="absolute right-4 top-4 text-slate-400 hover:text-slate-650 p-1 cursor-pointer"
+            >
+              <X className="w-5 h-5" />
+            </button>
+
+            <h3 className="text-base font-extrabold text-slate-900 border-b border-gray-150 pb-3 mb-4 flex items-center gap-1.5">
+              <Lock className="w-5 h-5 text-emerald-600" />
+              <span>{lang === "bn" ? "নতুন পাসওয়ার্ড সেট করুন" : "Set New Password"}</span>
+            </h3>
+
+            <form onSubmit={handleSetNewPasswordSubmit} className="space-y-4">
+              <div className="space-y-1.5">
+                <span className="text-[10px] text-slate-400 font-bold block uppercase tracking-wide">Target Administrator:</span>
+                <p className="text-xs font-bold text-slate-900 bg-gray-50 p-2.5 rounded-lg border border-gray-150 truncate">
+                  {passwordResetTarget.email}
+                </p>
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-slate-700 uppercase">New Password</label>
+                <input
+                  type="password"
+                  value={newPasswordVal}
+                  onChange={(e) => setNewPasswordVal(e.target.value)}
+                  placeholder={lang === "bn" ? "কমপক্ষে ৬ সংখ্যার নতুন পাসওয়ার্ড" : "At least 6 characters"}
+                  className="w-full h-11 px-3 rounded-xl border border-gray-200 focus:ring-2 focus:ring-emerald-500 font-normal text-sm"
+                  minLength={6}
+                  required
+                />
+              </div>
+
+              <button
+                type="submit"
+                disabled={settingNewPassword}
+                className="w-full h-11 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-sm shadow-md transition-all active:scale-[0.98] disabled:opacity-50 flex items-center justify-center gap-1.5 cursor-pointer"
+              >
+                {settingNewPassword ? <Loader2 className="w-5 h-5 animate-spin" /> : <Check className="w-4 h-4" />}
+                <span>{settingNewPassword ? (lang === "bn" ? "সেট হচ্ছে..." : "Setting Password...") : (lang === "bn" ? "পাসওয়ার্ড আপডেট করুন" : "Update Password")}</span>
+              </button>
+            </form>
           </div>
         </div>
       )}
