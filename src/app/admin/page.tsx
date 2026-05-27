@@ -89,7 +89,10 @@ import {
   Search,
   UploadCloud,
   FileDown,
-  Settings
+  Settings,
+  PenTool,
+  Eye,
+  Image
 } from "lucide-react";
 
 // Recharts vectors for dashboard
@@ -477,6 +480,12 @@ export default function AdminPage() {
 
   // --- Success Manual Cash Modal State (For Receipt download) ---
   const [recentSavedCash, setRecentSavedCash] = useState<Donation | null>(null);
+
+  // --- Lightbox & Custom Admin Password Modals ---
+  const [previewVoucherUrl, setPreviewVoucherUrl] = useState<string | null>(null);
+  const [passwordResetTarget, setPasswordResetTarget] = useState<UserProfile | null>(null);
+  const [newPasswordVal, setNewPasswordVal] = useState("");
+  const [settingNewPassword, setSettingNewPassword] = useState(false);
 
   // --- Reporting PDF state ---
   const [downloadingPdf, setDownloadingPdf] = useState(false);
@@ -1000,25 +1009,58 @@ export default function AdminPage() {
     }
   };
 
-  // --- SuperAdmin: Add Admin Email ---
+  // --- SuperAdmin: Add Admin Email & Password ---
   const handleAddAdmin = async (e: React.FormEvent) => {
     e.preventDefault();
     const targetEmail = newAdminEmail.trim().toLowerCase();
+    const targetPassword = newAdminPassword;
 
     if (!targetEmail) {
       triggerToast("error", t.saveError, lang === "bn" ? "ইমেইল দিন।" : "Please enter email.");
       return;
     }
 
+    if (!targetPassword || targetPassword.length < 6) {
+      triggerToast("error", t.saveError, lang === "bn" ? "পাসওয়ার্ড অবশ্যই কমপক্ষে ৬ অক্ষরের হতে হবে।" : "Password must be at least 6 characters.");
+      return;
+    }
+
+    let secondaryAppInstance: any = null;
     try {
       setSubmitting(true);
-      await setUserProfile(targetEmail, newAdminRole);
+      
+      // Initialize secondary app for non-disruptive Firebase Auth account creation
+      const secondaryAppName = `SecondaryApp_${Date.now()}`;
+      const { initializeApp: initSecApp, deleteApp: delSecApp } = await import("firebase/app");
+      const { getAuth: getSecAuth, createUserWithEmailAndPassword: createSecUser, signOut: secSignOut } = await import("firebase/auth");
+      
+      secondaryAppInstance = initSecApp(firebaseConfig, secondaryAppName);
+      const secondaryAuth = getSecAuth(secondaryAppInstance);
+      
+      // Create user auth in Firebase Auth directly
+      await createSecUser(secondaryAuth, targetEmail, targetPassword);
+      await secSignOut(secondaryAuth);
+      
+      // Save profile to Firestore with password
+      await setUserProfile(targetEmail, newAdminRole, targetPassword);
+      
+      // Reset inputs
       setNewAdminEmail("");
-      triggerToast("success", t.saveSuccess, lang === "bn" ? "অ্যাডমিন সফলভাবে যুক্ত হয়েছে।" : "Admin successfully added.");
-      await loadAdminData();
-    } catch (err) {
-      triggerToast("error", t.saveError, t.saveError);
+      setNewAdminPassword("");
+      
+      triggerToast("success", t.saveSuccess, lang === "bn" ? "অ্যাডমিন অ্যাকাউন্ট সফলভাবে তৈরি হয়েছে!" : "Admin account successfully created!");
+    } catch (err: any) {
+      console.error("Error creating secondary auth user:", err);
+      triggerToast("error", t.saveError, err.message || t.saveError);
     } finally {
+      if (secondaryAppInstance) {
+        const { deleteApp: delSecApp } = await import("firebase/app");
+        try {
+          await delSecApp(secondaryAppInstance);
+        } catch (e) {
+          console.error("Error deleting secondary app:", e);
+        }
+      }
       setSubmitting(false);
     }
   };
@@ -1236,11 +1278,53 @@ export default function AdminPage() {
     }
   };
 
-  // --- SuperAdmin: Send Admin Password Reset Email ---
-  const handleResetAdminPassword = async (email: string) => {
+  // --- SuperAdmin: Set New Password via Secondary App ---
+  const handleSetNewPasswordSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!passwordResetTarget) return;
+
+    const targetEmail = passwordResetTarget.email.toLowerCase();
+    const targetPassword = newPasswordVal;
+
+    if (!targetPassword || targetPassword.length < 6) {
+      triggerToast("error", t.saveError, lang === "bn" ? "পাসওয়ার্ড অবশ্যই কমপক্ষে ৬ অক্ষরের হতে হবে।" : "Password must be at least 6 characters.");
+      return;
+    }
+
+    let secondaryAppInstance: any = null;
     try {
-      setSubmitting(true);
-      await sendPasswordResetEmail(auth, email);
+      setSettingNewPassword(true);
+
+      const secondaryAppName = `SecondaryAppSet_${Date.now()}`;
+      const { initializeApp: initSecApp, deleteApp: delSecApp } = await import("firebase/app");
+      const { getAuth: getSecAuth, signInWithEmailAndPassword: loginSecUser, updatePassword: updateSecPassword, signOut: secSignOut } = await import("firebase/auth");
+
+      secondaryAppInstance = initSecApp(firebaseConfig, secondaryAppName);
+      const secondaryAuth = getSecAuth(secondaryAppInstance);
+
+      // Attempt to authenticate as the target user. 
+      // First try the password stored in Firestore. If none, fall back to "masjid123"
+      const currentStoredPassword = passwordResetTarget.password || "masjid123";
+
+      try {
+        await loginSecUser(secondaryAuth, targetEmail, currentStoredPassword);
+      } catch (authErr: any) {
+        // If login with stored password fails and it wasn't masjid123, try masjid123 as fallback
+        if (currentStoredPassword !== "masjid123") {
+          await loginSecUser(secondaryAuth, targetEmail, "masjid123");
+        } else {
+          throw authErr;
+        }
+      }
+
+      if (secondaryAuth.currentUser) {
+        // Direct password force-update
+        await updateSecPassword(secondaryAuth.currentUser, targetPassword);
+        await secSignOut(secondaryAuth);
+      }
+
+      // Update Firestore document with the new password
+      await setUserProfile(targetEmail, passwordResetTarget.role, targetPassword);
 
       // Audit Logging
       if (adminProfile) {
@@ -1248,15 +1332,26 @@ export default function AdminPage() {
           adminEmail: adminProfile.email,
           actionType: "update",
           collectionName: "notices" as any,
-          details: `Triggered password reset email for admin: ${email}`
+          details: `Directly updated password for admin: ${targetEmail}`
         });
       }
 
-      triggerToast("success", lang === "bn" ? "রিসেট ইমেইল পাঠানো হয়েছে!" : "Reset Email Sent", lang === "bn" ? "পাসওয়ার্ড রিসেট ইমেইল সফলভাবে পাঠানো হয়েছে।" : "Password reset email sent successfully.");
+      triggerToast("success", lang === "bn" ? "পাসওয়ার্ড সফলভাবে সেট হয়েছে!" : "Password Set Successfully", lang === "bn" ? "অ্যাডমিন পাসওয়ার্ড সফলভাবে আপডেট করা হয়েছে।" : "Admin password directly updated successfully.");
+      setPasswordResetTarget(null);
+      setNewPasswordVal("");
     } catch (err: any) {
-      triggerToast("error", t.saveError, err.message || t.saveError);
+      console.error("Error setting user password directly:", err);
+      triggerToast("error", t.saveError, err.message || (lang === "bn" ? "পাসওয়ার্ড সেট করতে ব্যর্থ হয়েছে।" : "Failed to set user password. Verify auth credentials."));
     } finally {
-      setSubmitting(false);
+      if (secondaryAppInstance) {
+        const { deleteApp: delSecApp } = await import("firebase/app");
+        try {
+          await delSecApp(secondaryAppInstance);
+        } catch (e) {
+          console.error("Error deleting secondary app:", e);
+        }
+      }
+      setSettingNewPassword(false);
     }
   };
 
@@ -1688,7 +1783,7 @@ export default function AdminPage() {
                       activeTab === "settings" ? "bg-emerald-50 text-emerald-800 shadow-inner" : "text-slate-600 hover:bg-gray-50"
                     }`}
                   >
-                    <Settings className="w-4.5 h-4.5 shrink-0 text-emerald-800" />
+                    <PenTool className="w-4.5 h-4.5 shrink-0 text-emerald-800" />
                     <span>{lang === "bn" ? "স্বাক্ষরসমূহ" : "Signatures"}</span>
                   </button>
                 </>
@@ -2342,15 +2437,13 @@ export default function AdminPage() {
                               </td>
                               <td className="py-3 px-2 text-center font-mono">
                                 {e.voucherUrl ? (
-                                  <a
-                                    href={e.voucherUrl}
-                                    target="_blank"
-                                    rel="noreferrer"
-                                    className="text-emerald-600 hover:underline font-bold text-[10px] flex items-center justify-center gap-0.5"
+                                  <button
+                                    onClick={() => setPreviewVoucherUrl(e.voucherUrl || null)}
+                                    className="text-emerald-600 hover:text-emerald-850 font-bold text-[10px] flex items-center justify-center gap-0.5 cursor-pointer bg-transparent border-0 mx-auto"
                                   >
-                                    <FileText className="w-3.5 h-3.5" />
+                                    <Eye className="w-3.5 h-3.5" />
                                     <span>View</span>
-                                  </a>
+                                  </button>
                                 ) : (
                                   <span className="text-slate-400 font-semibold">N/A</span>
                                 )}
@@ -2932,16 +3025,19 @@ export default function AdminPage() {
                                 <span>{lang === "bn" ? "ভূমিকা পরিবর্তন" : "Change Role"}</span>
                               </button>
 
-                              {/* Reset Password Button */}
-                              <button
-                                onClick={() => handleResetAdminPassword(adm.email)}
-                                disabled={submitting}
-                                className="text-xs font-bold text-slate-600 hover:text-sky-750 px-2 py-1 rounded-lg border border-slate-200 hover:border-sky-200 hover:bg-sky-50 transition-all flex items-center gap-1 cursor-pointer disabled:opacity-50"
-                                title={lang === "bn" ? "পাসওয়ার্ড রিসেট ইমেইল পাঠান" : "Send Reset Email"}
-                              >
-                                <Lock className="w-3.5 h-3.5 text-sky-700" />
-                                <span>{lang === "bn" ? "পাসওয়ার্ড রিসেট" : "Reset Password"}</span>
-                              </button>
+                               {/* Set New Password Button */}
+                               <button
+                                 onClick={() => {
+                                   setPasswordResetTarget(adm);
+                                   setNewPasswordVal("");
+                                 }}
+                                 disabled={submitting}
+                                 className="text-xs font-bold text-slate-600 hover:text-sky-750 px-2 py-1 rounded-lg border border-slate-200 hover:border-sky-200 hover:bg-sky-50 transition-all flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                                 title={lang === "bn" ? "নতুন পাসওয়ার্ড সেট করুন" : "Set New Password"}
+                                >
+                                 <Lock className="w-3.5 h-3.5 text-sky-700" />
+                                 <span>{lang === "bn" ? "পাসওয়ার্ড পরিবর্তন" : "Set New Password"}</span>
+                               </button>
                               
                               {/* Delete Button */}
                               <button
@@ -3355,6 +3451,96 @@ export default function AdminPage() {
         </div>
       )}
 
+      {/* ========================================================
+          MODAL: EXPENSE VOUCHER IMAGE PREVIEW (LIGHTBOX)
+          ======================================================== */}
+      {previewVoucherUrl && (
+        <div className="fixed inset-0 bg-slate-900/80 z-50 flex items-center justify-center p-4 backdrop-blur-md animate-fadeIn">
+          <div className="bg-white rounded-3xl p-6 w-full max-w-2xl shadow-2xl border border-gray-100 relative max-h-[90vh] flex flex-col">
+            <button
+              onClick={() => setPreviewVoucherUrl(null)}
+              className="absolute right-4 top-4 text-slate-400 hover:text-slate-650 p-2 cursor-pointer bg-slate-50 hover:bg-slate-100 rounded-full transition-all"
+            >
+              <X className="w-5 h-5" />
+            </button>
+
+            <h3 className="text-base font-extrabold text-slate-900 border-b border-gray-150 pb-3 mb-4 flex items-center gap-2">
+              <Image className="w-5 h-5 text-emerald-600" />
+              <span>{lang === "bn" ? "ভাউচার ভিউয়ার" : "Voucher Image Preview"}</span>
+            </h3>
+
+            <div className="flex-1 overflow-auto flex items-center justify-center bg-slate-50/50 rounded-2xl p-4 border border-slate-100 min-h-[300px]">
+              <img
+                src={previewVoucherUrl}
+                alt="Expense Voucher Preview"
+                className="max-h-[60vh] max-w-full rounded-lg object-contain shadow-sm"
+              />
+            </div>
+
+            <div className="pt-4 border-t border-gray-100 flex justify-end mt-4">
+              <button
+                onClick={() => setPreviewVoucherUrl(null)}
+                className="px-5 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs transition-all active:scale-[0.98] cursor-pointer"
+              >
+                {lang === "bn" ? "বন্ধ করুন" : "Close Viewer"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================
+          MODAL: SUPERADMIN FORCE SET NEW PASSWORD
+          ======================================================== */}
+      {passwordResetTarget && (
+        <div className="fixed inset-0 bg-slate-900/60 z-50 flex items-center justify-center p-4 backdrop-blur-sm animate-fadeIn">
+          <div className="bg-white rounded-3xl p-6 w-full max-w-md shadow-2xl border border-gray-100 relative">
+            <button
+              onClick={() => setPasswordResetTarget(null)}
+              className="absolute right-4 top-4 text-slate-400 hover:text-slate-650 p-1 cursor-pointer"
+            >
+              <X className="w-5 h-5" />
+            </button>
+
+            <h3 className="text-base font-extrabold text-slate-900 border-b border-gray-150 pb-3 mb-4 flex items-center gap-1.5">
+              <Lock className="w-5 h-5 text-emerald-600" />
+              <span>{lang === "bn" ? "নতুন পাসওয়ার্ড সেট করুন" : "Set New Password"}</span>
+            </h3>
+
+            <form onSubmit={handleSetNewPasswordSubmit} className="space-y-4">
+              <div className="space-y-1.5">
+                <span className="text-[10px] text-slate-400 font-bold block uppercase tracking-wide">Target Administrator:</span>
+                <p className="text-xs font-bold text-slate-900 bg-gray-50 p-2.5 rounded-lg border border-gray-150 truncate">
+                  {passwordResetTarget.email}
+                </p>
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-slate-700 uppercase">New Password</label>
+                <input
+                  type="password"
+                  value={newPasswordVal}
+                  onChange={(e) => setNewPasswordVal(e.target.value)}
+                  placeholder={lang === "bn" ? "কমপক্ষে ৬ সংখ্যার নতুন পাসওয়ার্ড" : "At least 6 characters"}
+                  className="w-full h-11 px-3 rounded-xl border border-gray-200 focus:ring-2 focus:ring-emerald-500 font-normal text-sm"
+                  minLength={6}
+                  required
+                />
+              </div>
+
+              <button
+                type="submit"
+                disabled={settingNewPassword}
+                className="w-full h-11 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-sm shadow-md transition-all active:scale-[0.98] disabled:opacity-50 flex items-center justify-center gap-1.5 cursor-pointer"
+              >
+                {settingNewPassword ? <Loader2 className="w-5 h-5 animate-spin" /> : <Check className="w-4 h-4" />}
+                <span>{settingNewPassword ? (lang === "bn" ? "সেট হচ্ছে..." : "Setting Password...") : (lang === "bn" ? "পাসওয়ার্ড আপডেট করুন" : "Update Password")}</span>
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
+
         {/* Hidden A4 HTML template for high-fidelity PDF Financial Statement generation */}
         <div style={{ position: "absolute", left: "-9999px", top: "-9999px" }}>
           <div
@@ -3466,7 +3652,6 @@ export default function AdminPage() {
                       src={globalSettings.treasurerSignatureUrl}
                       alt="Treasurer Signature"
                       className="h-12 object-contain mb-1 select-none pointer-events-none"
-                      crossOrigin="anonymous"
                     />
                   ) : (
                     <div className="h-12 w-3/4 mb-1" style={{ borderBottom: "1px dashed #cbd5e1" }} />
@@ -3482,7 +3667,6 @@ export default function AdminPage() {
                       src={globalSettings.presidentSignatureUrl}
                       alt="President Signature"
                       className="h-12 object-contain mb-1 select-none pointer-events-none"
-                      crossOrigin="anonymous"
                     />
                   ) : (
                     <div className="h-12 w-3/4 mb-1" style={{ borderBottom: "1px dashed #cbd5e1" }} />
@@ -3597,7 +3781,6 @@ export default function AdminPage() {
                       src={globalSettings.treasurerSignatureUrl}
                       alt="Treasurer Signature"
                       className="h-12 object-contain mb-1 select-none pointer-events-none"
-                      crossOrigin="anonymous"
                     />
                   ) : (
                     <div className="h-12 w-3/4 mb-1" style={{ borderBottom: "1px dashed #cbd5e1" }} />
@@ -3613,7 +3796,6 @@ export default function AdminPage() {
                       src={globalSettings.presidentSignatureUrl}
                       alt="President Signature"
                       className="h-12 object-contain mb-1 select-none pointer-events-none"
-                      crossOrigin="anonymous"
                     />
                   ) : (
                     <div className="h-12 w-3/4 mb-1" style={{ borderBottom: "1px dashed #cbd5e1" }} />

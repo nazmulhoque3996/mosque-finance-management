@@ -25,6 +25,7 @@ export interface UserProfile {
   id?: string;
   email: string;
   role: UserRole;
+  password?: string;
 }
 
 export interface Donation {
@@ -143,18 +144,24 @@ function mapNoticeDoc(doc: QueryDocumentSnapshot<DocumentData>): Notice {
 // 3. User & Authentication Utilities
 // ==========================================
 
-export async function setUserProfile(email: string, role: UserRole): Promise<void> {
+export async function setUserProfile(email: string, role: UserRole, password?: string): Promise<void> {
   const usersCollection = collection(db, "users");
   const q = query(usersCollection, where("email", "==", email.toLowerCase()));
   const snapshot = await getDocs(q);
 
+  const dataToSet: any = { role };
+  if (password) {
+    dataToSet.password = password;
+  }
+
   if (!snapshot.empty) {
     const userDocId = snapshot.docs[0].id;
-    await updateDoc(doc(db, "users", userDocId), { role });
+    await updateDoc(doc(db, "users", userDocId), dataToSet);
   } else {
     await addDoc(usersCollection, {
       email: email.toLowerCase(),
       role,
+      ...(password ? { password } : {}),
     });
   }
 }
@@ -170,6 +177,7 @@ export async function getUserProfile(email: string): Promise<UserProfile | null>
     id: snapshot.docs[0].id,
     email: data.email,
     role: data.role as UserRole,
+    password: data.password || undefined,
   };
 }
 

@@ -12,6 +12,8 @@ import {
   Expense,
   Notice,
   DashboardStats,
+  getSystemSettings,
+  SystemSettings,
 } from "@/lib/firestoreUtils";
 import { collection, addDoc, getDocs } from "firebase/firestore";
 import { db } from "@/lib/firebase";
@@ -307,8 +309,10 @@ export default function Home() {
     expenseByCategory: {},
   });
   const [donations, setDonations] = useState<Donation[]>([]);
+  const [searchableDonations, setSearchableDonations] = useState<Donation[]>([]);
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [notices, setNotices] = useState<Notice[]>([]);
+  const [globalSettings, setGlobalSettings] = useState<SystemSettings | null>(null);
   
   // --- Notification Toast ---
   const [toast, setToast] = useState<{
@@ -407,9 +411,25 @@ export default function Home() {
     doc.setFontSize(7);
     doc.setTextColor(100, 116, 139);
     
+    // Render Treasurer Signature if available
+    if (globalSettings?.treasurerSignatureUrl) {
+      try {
+        doc.addImage(globalSettings.treasurerSignatureUrl, "PNG", 25, 158, 25, 20);
+      } catch (err) {
+        console.error("Error drawing treasurer signature:", err);
+      }
+    }
     doc.line(20, 180, 55, 180);
     doc.text("Masjid Treasurer", 37, 184, { align: "center" });
     
+    // Render President Signature if available
+    if (globalSettings?.presidentSignatureUrl) {
+      try {
+        doc.addImage(globalSettings.presidentSignatureUrl, "PNG", 98, 158, 25, 20);
+      } catch (err) {
+        console.error("Error drawing president signature:", err);
+      }
+    }
     doc.line(93, 180, 128, 180);
     doc.text("Mosque Committee President", 110, 184, { align: "center" });
 
@@ -538,16 +558,19 @@ export default function Home() {
       }
 
       // Fetch lists (keep them fully comprehensive chronologically)
-      const [allDonations, allExpenses, allNotices] = await Promise.all([
-        getDonations("approved"),
+      const [allDonations, allExpenses, allNotices, settings] = await Promise.all([
+        getDonations(), // Fetch ALL donations for full-history receipt lookup!
         getExpenses(),
         getNotices(),
+        getSystemSettings(),
       ]);
 
       setStats(currentStats);
-      setDonations(allDonations);
+      setDonations(allDonations.filter(d => d.status === "approved")); // Only approved on transparent ledger!
+      setSearchableDonations(allDonations); // Comprehensive list for tracking
       setExpenses(allExpenses);
       setNotices(allNotices);
+      setGlobalSettings(settings);
     } catch (error) {
       console.error("Error loading transparent dashboard data:", error);
     } finally {
@@ -638,8 +661,13 @@ export default function Home() {
     
     // Simulate real-time database lookup delay (1.2s)
     setTimeout(() => {
-      // Direct live lookup in the client-side array
-      const match = donations.find(d => d.trxId?.toLowerCase() === queryTerm.toLowerCase());
+      // Case-insensitive direct lookup checking TrxID, Receipt ID, and Document ID
+      const cleanedQuery = queryTerm.toUpperCase();
+      const match = searchableDonations.find(d => 
+        d.trxId?.toUpperCase() === cleanedQuery || 
+        d.receiptId?.toUpperCase() === cleanedQuery ||
+        d.id?.toUpperCase() === cleanedQuery
+      );
       
       if (match) {
         setTrackResult(match);
